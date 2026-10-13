@@ -1,52 +1,460 @@
+// Challenge 16: Monte Carlo Pricer -- public benchmark
+//
+// The certified run uses the same code with options drawn from private seeds.
+
 #include "common/benchmark_harness.h"
 #include "solution/solution.h"
 #include "types.h"
 
-#include <random>
-#include <vector>
 #include <cmath>
+#include <cstdio>
+#include <limits>
+#include <vector>
 
 namespace {
 
-std::vector<hftu::MCOption> generate_options(int count, uint64_t seed) {
-    std::mt19937_64 rng(seed);
-    std::vector<hftu::MCOption> opts(count);
+// One option and its reference price. kScored is the batch the public benchmark
+// always timed: generate_options(200, 0xABCD01), with
+//   spot U(80,120), strike spot*U(0.85,1.15), rate U(0.02,0.05), vol U(0.10,0.60),
+//   T U(0.25,2), type 0-3 and call/put uniform, barrier spot*1.15 (up) or *0.85 (down);
+// kHeldout is a second batch from seed 0x5EED16.
+//   ref     Black-Scholes for Europeans (exact for the 100-step model), else a
+//           10M-path antithetic simulation of the skeleton's model
+//   ref_se  standard error of ref (0 for Europeans)
+//   se10k   standard error of a plain 10,000-path simulation of the option
+struct RefRow {
+    double spot, strike, rate, vol, time_to_expiry, barrier;
+    int type;
+    bool is_call;
+    double ref, ref_se, se10k;
+};
 
-    std::uniform_real_distribution<double> spot_dist(80.0, 120.0);
-    std::uniform_real_distribution<double> moneyness_dist(0.85, 1.15);
-    std::uniform_real_distribution<double> rate_dist(0.02, 0.05);
-    std::uniform_real_distribution<double> vol_dist(0.10, 0.60);
-    std::uniform_real_distribution<double> tte_dist(0.25, 2.0);
-    std::uniform_int_distribution<int> type_dist(0, 3);
-    std::uniform_int_distribution<int> call_dist(0, 1);
+// BEGIN REFERENCE DATA
+// 10000000-path antithetic reference prices (Black-Scholes for Europeans).
+// generate_options(200, 0xABCD01)
+constexpr RefRow kScored[200] = {
+    {0x1.954814bcb69fep+6, 0x1.5a353025f75f9p+6, 0x1.642c9fadfc6a9p-5, 0x1.10a0209f7a96cp-1, 0x1.1363a7d764be1p-1, 0x0p+0, 0, false, 0x1.dfb692382960ep+2, 0x0p+0, 0x1.f7057d9d4cd93p-4},
+    {0x1.dbe9933c77526p+6, 0x1.bb4770cbd983bp+6, 0x1.1c3955e8bb769p-5, 0x1.2c36c8d19ccf6p-1, 0x1.05a51807fa1b4p-1, 0x0p+0, 1, false, 0x1.be60d892d602fp+2, 0x1.5e3963dac5459p-9, 0x1.c0c5adec700bp-4},
+    {0x1.de500c746aeecp+6, 0x1.02e3614890a4dp+7, 0x1.e58f241b01495p-6, 0x1.ad55562e17c1cp-2, 0x1.bfd7af06031a8p+0, 0x1.9690d762f47e2p+6, 3, true, 0x1.0d020dcd162b2p+4, 0x1.de0ce35c3038cp-7, 0x1.f6cf110a588bap-2},
+    {0x1.6b5b85f52c40ap+6, 0x1.8e595cb3df94bp+6, 0x1.7b4fc65bc19bcp-5, 0x1.9a20760a241a8p-2, 0x1.1d26b45589a19p+0, 0x1.34da984398d08p+6, 3, true, 0x1.57361b73231acp+3, 0x1.f781b6e5772d9p-8, 0x1.0ff302141fc88p-2},
+    {0x1.ac851e7482cbcp+6, 0x1.e69a9d8656ed4p+6, 0x1.c2e92f5e5ae67p-6, 0x1.033cc06223da5p-1, 0x1.08a406498f533p-1, 0x0p+0, 0, true, 0x1.5892071e00fa2p+3, 0x0p+0, 0x1.f3b18bd4c70f7p-3},
+    {0x1.cc35ed85527d2p+6, 0x1.d90d6f646b962p+6, 0x1.f91551116a056p-6, 0x1.b650450f4ff3dp-4, 0x1.6cfd63ee72eb7p-1, 0x0p+0, 1, false, 0x1.bca062dacd0a2p+1, 0x1.692ccdbd434dbp-11, 0x1.4816cede03ea2p-5},
+    {0x1.88dcb9e5c6229p+6, 0x1.8059adf2bd16ap+6, 0x1.121f0c2257633p-5, 0x1.ddaeb9c2e6f6bp-4, 0x1.56290e915f6c7p+0, 0x1.c3caa2950a415p+6, 2, true, 0x1.f8b2ae18feb76p+0, 0x1.36b743356ba5bp-10, 0x1.2e9c610e98471p-5},
+    {0x1.c8e3de2999bb2p+6, 0x1.f3a19674bc807p+6, 0x1.58e6d7a7c85bp-5, 0x1.10a1357104dcbp-1, 0x1.b5171e7f32122p-1, 0x0p+0, 1, true, 0x1.339e6fb81479dp+3, 0x1.7a9e277eb436bp-8, 0x1.a6ca5fc56eee1p-3},
+    {0x1.8d9939abcb8dap+6, 0x1.6f2d68a6166fap+6, 0x1.5dd33d0f081acp-6, 0x1.6826ecf4b2e6ep-2, 0x1.0d0b7f4d5123ep+0, 0x1.51f5710539d2p+6, 3, false, 0x1.59f834d7ba123p-5, 0x1.14c17ccf53c3fp-13, 0x1.12e3e8a0abae9p-8},
+    {0x1.5180c1825516p+6, 0x1.3d1fbcd4a4439p+6, 0x1.9e140ac57daap-6, 0x1.82ae4f01282bap-2, 0x1.f0234ae910058p+0, 0x0p+0, 0, true, 0x1.56039f164b853p+4, 0x0p+0, 0x1.8a2c3dc25256dp-2},
+    {0x1.bde3a3ceeab8fp+6, 0x1.9574c14841231p+6, 0x1.3f74af84d70d2p-5, 0x1.3ad1a0da1b692p-3, 0x1.032bf6ae0dbacp-2, 0x1.0062e496fa2a5p+7, 2, false, 0x1.51363d72839d8p-2, 0x1.b9a5a2fcd45c3p-12, 0x1.c1952f1341266p-7},
+    {0x1.595c099803866p+6, 0x1.6e6f8f70b684dp+6, 0x1.491d00c636965p-5, 0x1.4fbd5233ef52ap-2, 0x1.451a5846eeff3p-1, 0x0p+0, 1, false, 0x1.e579f6dc506bp+2, 0x1.44a149c1d704ap-10, 0x1.4fddc2a65fb11p-4},
+    {0x1.657bfb42928fap+6, 0x1.70a9f7b3d3b9p+6, 0x1.4e993a0429bf9p-5, 0x1.30f5ef7534f07p-1, 0x1.31745595569fep+0, 0x0p+0, 1, true, 0x1.9d4b5e304d86fp+3, 0x1.ca6eb83580d04p-8, 0x1.064c0e7391ad4p-2},
+    {0x1.d0f87d952bb8dp+6, 0x1.08c503ef17449p+7, 0x1.443276e64081dp-5, 0x1.2fbc1434c27b7p-1, 0x1.d00a5f9284fedp+0, 0x1.0b5bae9c2c571p+7, 2, false, 0x1.260f54252f779p+4, 0x1.2cd6bcffb91dbp-7, 0x1.5fd592d7c047ap-2},
+    {0x1.4350a792c3965p+6, 0x1.3b73f4c11358dp+6, 0x1.c8a44e0910c6ep-6, 0x1.9e2722e448c9ap-2, 0x1.07bc20c22b0b9p-2, 0x1.12d15b3cbfd96p+6, 3, false, 0x1.d0d22ce9308b7p-2, 0x1.e5ea7656dafb9p-12, 0x1.f6b28a636bd03p-7},
+    {0x1.babcc166a6a67p+6, 0x1.e5e617d18c151p+6, 0x1.d130347393102p-6, 0x1.f6fdc1d046515p-3, 0x1.3d6aa3afe5513p-1, 0x1.fd25de693fa5cp+6, 2, true, 0x1.6710fd79b2477p-5, 0x1.f118c8ab24039p-14, 0x1.ee95c017d5a29p-9},
+    {0x1.dfb5c15f1531p+6, 0x1.9b47d636523a9p+6, 0x1.97cb2fe08be08p-5, 0x1.12e826b253378p-2, 0x1.3912e6971f8dp+0, 0x0p+0, 0, false, 0x1.173980d6081bfp+2, 0x0p+0, 0x1.779ac7c06cc42p-4},
+    {0x1.7cfe616ad92cp+6, 0x1.4a1b591181acdp+6, 0x1.b80f63eaa26dep-6, 0x1.2aafb2569b632p-1, 0x1.2c58d7b6106cdp+0, 0x1.43d839346bcbdp+6, 3, false, 0x1.c6146116fc2e3p-12, 0x1.b6d22b1dab827p-18, 0x1.b1be3de0b8cb8p-13},
+    {0x1.62c2fadcd4f88p+6, 0x1.39ec519344116p+6, 0x1.88d9fd9c42a1p-6, 0x1.90871c2141c44p-3, 0x1.0301fcf49eb54p+0, 0x0p+0, 1, true, 0x1.7221662929149p+3, 0x1.00d842569281cp-10, 0x1.7cf8aba408605p-4},
+    {0x1.db3f6a7e59d6dp+6, 0x1.cf0df561abc7bp+6, 0x1.d3d6e22875f24p-6, 0x1.d9ee9bc8d2f48p-3, 0x1.e5761ae17e1d2p+0, 0x1.93f5e751cc5dp+6, 3, false, 0x1.dfae37cb6715ap-3, 0x1.b68b1b211052fp-12, 0x1.b81e034ccc281p-7},
+    {0x1.ac4251d4955ap+6, 0x1.70f9be36e35fdp+6, 0x1.81a5034fc907dp-5, 0x1.2d88573ea2afcp-2, 0x1.924d46f52359fp-1, 0x0p+0, 1, false, 0x1.e95e01a444c3bp-1, 0x1.d6b09e6012b7ap-11, 0x1.eacb6319c81dfp-6},
+    {0x1.d53015010b07p+6, 0x1.0d5b7e16412a3p+7, 0x1.1228dfc4958b9p-5, 0x1.e2d7d0d14a026p-2, 0x1.88622599d297ep+0, 0x0p+0, 0, true, 0x1.722a97a5a1877p+4, 0x0p+0, 0x1.167cc6d822dbdp-1},
+    {0x1.ab036627b2738p+6, 0x1.db1cb488d3649p+6, 0x1.7d68cfa66ccedp-5, 0x1.166fdc0a9d823p-1, 0x1.ddbc8486c7d9ap-1, 0x1.6af616d4f1489p+6, 3, true, 0x1.b6cba60128ebbp+3, 0x1.830af86dc5763p-7, 0x1.9770aa0a1facfp-2},
+    {0x1.d1b122a49c5a5p+6, 0x1.a18b16709cca6p+6, 0x1.3ca5ddf642d4ap-5, 0x1.a56e2b14a764p-2, 0x1.35f8e8c4d7b97p+0, 0x1.8bd690a584e66p+6, 3, false, 0x1.48a21c26c1811p-7, 0x1.d85d70db38fc8p-15, 0x1.d38953ae4b1aep-10},
+    {0x1.b453764230616p+6, 0x1.aef207d387541p+6, 0x1.6cc89f9ef1445p-5, 0x1.4fce95bce591cp-2, 0x1.ff1559c76a34ep-1, 0x1.72e08aeb75ec6p+6, 3, false, 0x1.11def805703acp-2, 0x1.d908b29b13f85p-12, 0x1.db9a1e23c8805p-7},
+    {0x1.db2aa02435864p+6, 0x1.cbbd75c55f95ep+6, 0x1.61c1a5a5d09dbp-5, 0x1.9ba0d239e4a12p-2, 0x1.d9e1f136bbef4p-1, 0x1.1138827b38606p+7, 2, true, 0x1.15c9ac669a6abp-2, 0x1.1b2e7c15e89ep-11, 0x1.1b59d822d8568p-6},
+    {0x1.96926c4e9d34p+6, 0x1.ba4715221c55dp+6, 0x1.11482d9d94e26p-5, 0x1.2a4ca4f9ab4bbp-2, 0x1.7597a9ac9be59p+0, 0x1.d38ec95a67fbcp+6, 2, true, 0x1.1c83d498ec9a2p-6, 0x1.4939060d6c575p-14, 0x1.462313b5ae9fep-9},
+    {0x1.7a4c3ade870c5p+6, 0x1.97f8969e2e6fbp+6, 0x1.8c76cd4e8e8fep-6, 0x1.b9e3c05eff8fp-3, 0x1.1458a54541628p-1, 0x0p+0, 0, false, 0x1.35f2ae0197afdp+3, 0x0p+0, 0x1.99ec0f4845ae6p-4},
+    {0x1.c32b5aa8af6c8p+6, 0x1.e726b68929832p+6, 0x1.193fe539f1aecp-5, 0x1.9306916adb97ep-2, 0x1.4a0dce9180233p+0, 0x1.036c20edcb44cp+7, 2, true, 0x1.f553e5a7f3335p-7, 0x1.5cc0b0ea17e99p-14, 0x1.593974221a7f8p-9},
+    {0x1.cc17285db2c1fp+6, 0x1.b6042d50a9e15p+6, 0x1.29cedaf2b403cp-5, 0x1.09b6a0ccf5cap-1, 0x1.992a142ae6a19p+0, 0x1.088d50cf79fc5p+7, 2, false, 0x1.8954237b3a21ap+3, 0x1.a1dac9f4bfdedp-8, 0x1.e39b2b122e8e2p-3},
+    {0x1.9362e2abce166p+6, 0x1.609d9a17b54dap+6, 0x1.ddab02f0e135p-6, 0x1.1902ec122f09cp-2, 0x1.20e5a3562b336p-1, 0x0p+0, 0, false, 0x1.4c9e87d570ba9p+1, 0x0p+0, 0x1.d9a718eea8d48p-5},
+    {0x1.454d76ba5735p+6, 0x1.31aee2663b9b3p+6, 0x1.aac3edb9520abp-6, 0x1.d44d3503a79f8p-3, 0x1.845a1ec47b05p+0, 0x1.1481d81e63b9dp+6, 3, true, 0x1.6bab468988a17p+3, 0x1.2ab62b90109c3p-8, 0x1.77a6c62830d46p-3},
+    {0x1.b6a1c4142bba4p+6, 0x1.b03ad5cf9220ap+6, 0x1.558610537e272p-5, 0x1.f92c198b4a02ap-3, 0x1.99137c6afe846p-2, 0x1.74d64d11252b2p+6, 3, false, 0x1.27a0f3a437fcdp+0, 0x1.ab45d8ad7138dp-11, 0x1.ceb04daa3f25ep-6},
+    {0x1.505e233bcce4cp+6, 0x1.4b384d851aa0ap+6, 0x1.99421b6b5770fp-5, 0x1.7029906eacb62p-2, 0x1.c4a1d8e593c68p-1, 0x1.82d2a884c53a4p+6, 2, true, 0x1.9d51884f18fd5p-3, 0x1.8550d224ea1aep-12, 0x1.865e38964e178p-7},
+    {0x1.c380ba3bd3345p+6, 0x1.d5db2ac75005fp+6, 0x1.4eeeff2b50782p-5, 0x1.5d1708d22f82ap-2, 0x1.2969804a30bdep-1, 0x1.7fc704b2d9ec7p+6, 3, true, 0x1.3f266c3e8ab8cp+3, 0x1.5550fdcb841ffp-8, 0x1.8a51834249757p-3},
+    {0x1.6c66d9e8c2b9cp+6, 0x1.6deae6f8935dp+6, 0x1.4a06d994aa53p-5, 0x1.876ae6ed69d23p-3, 0x1.602f6c3c61991p+0, 0x1.35bdd2d2a5844p+6, 3, false, 0x1.433ea3ddec548p-1, 0x1.44cde228b44fcp-11, 0x1.513b1afb317dbp-6},
+    {0x1.4d19f8bf46db8p+6, 0x1.27dddb93879e8p+6, 0x1.4f97f5d64be3bp-5, 0x1.9b9c0ed7fe3ccp-2, 0x1.af42a517a9eb1p+0, 0x0p+0, 1, false, 0x1.15663b6a5c13bp+2, 0x1.fad6b195e1f97p-10, 0x1.32fa2ebf28e0ep-4},
+    {0x1.af31703607524p+6, 0x1.7e36815479b5dp+6, 0x1.8cf28736bbd0ap-5, 0x1.d823bd9ab1a37p-3, 0x1.6a0205fffab67p-1, 0x0p+0, 1, true, 0x1.c762ab052238p+3, 0x1.2823b3ed3586fp-10, 0x1.c97de1e06d6ddp-4},
+    {0x1.4595fb71eaa1ap+6, 0x1.1ccfce30fc6e1p+6, 0x1.e82b317c76238p-6, 0x1.22dc4e23ff6aep-2, 0x1.af8d7a2c4a42dp-2, 0x1.766c7ac30106ap+6, 2, false, 0x1.a70960c811c75p+0, 0x1.2c77413af7f01p-10, 0x1.4653b47317281p-5},
+    {0x1.5d3209114e0aap+6, 0x1.52cd4686da42bp+6, 0x1.da4906078044dp-6, 0x1.1116a745f5fa7p-2, 0x1.128a4fbe4e53p+0, 0x1.9193240719bf6p+6, 2, false, 0x1.76f506ad67d57p+2, 0x1.4df09fef9e855p-9, 0x1.9807dcc62f287p-4},
+    {0x1.8de2426022b84p+6, 0x1.bbb4b97ae12d4p+6, 0x1.6933e1f19a393p-5, 0x1.ecd8a8cafc65cp-4, 0x1.9f165a3472a22p-2, 0x0p+0, 1, false, 0x1.4c63712301089p+3, 0x1.2a09005cb4369p-14, 0x1.6418c4dc27d0ap-5},
+    {0x1.b52803b4f6a7cp+6, 0x1.a8fd6f2c7f286p+6, 0x1.48bd9c58846a2p-6, 0x1.d9978295e14cap-2, 0x1.2f7419bde343p+0, 0x0p+0, 0, true, 0x1.80dc3b224dc08p+4, 0x0p+0, 0x1.d22ee36c86fbcp-2},
+    {0x1.52c6f58330848p+6, 0x1.3616b99106cd8p+6, 0x1.4ad3ba61e23c8p-5, 0x1.b82660d117e14p-4, 0x1.aeccfd7c6ab83p-1, 0x0p+0, 0, true, 0x1.4549d288d4c3ap+3, 0x0p+0, 0x1.3c49849288f48p-4},
+    {0x1.d38b3d98592b9p+6, 0x1.a021182e69251p+6, 0x1.165cff190aff4p-5, 0x1.a229ec7a9dba8p-2, 0x1.74ebcc0ef3ebcp+0, 0x0p+0, 0, true, 0x1.f1ae00d6aa3e6p+4, 0x0p+0, 0x1.0436bed96f853p-1},
+    {0x1.c6e095e38058bp+6, 0x1.a2d42647467bbp+6, 0x1.95127e6a9554fp-5, 0x1.883094703050ap-2, 0x1.8b00816da7aedp-2, 0x0p+0, 1, true, 0x1.846da09e6a1cep+3, 0x1.19e2bd8bbf6a8p-9, 0x1.0bc0879ad73eap-3},
+    {0x1.d0021baf3862cp+6, 0x1.f55ee413ece94p+6, 0x1.5ae43d2f0dfap-6, 0x1.3a70e80878c08p-2, 0x1.a4c1135976365p-1, 0x0p+0, 0, true, 0x1.3e838fe3e7b1ap+3, 0x0p+0, 0x1.992ff7b17185cp-3},
+    {0x1.62accaedb0c99p+6, 0x1.8d732d170a986p+6, 0x1.8aae06d4b8eebp-5, 0x1.cd849f763fe9ep-3, 0x1.65b165211117fp+0, 0x0p+0, 0, true, 0x1.e9b6d01294c5fp+2, 0x0p+0, 0x1.2f54e154781fp-3},
+    {0x1.d93a37c2354f8p+6, 0x1.a7bcaa939c46ep+6, 0x1.7e8cd2819e61ap-6, 0x1.c8eb956d7ea68p-2, 0x1.5b362c40b91b9p-1, 0x1.923e48fead506p+6, 3, false, 0x1.f74e921cc5449p-7, 0x1.256a35eb3134ep-14, 0x1.22a774293eb21p-9},
+    {0x1.bb1aee8989c25p+6, 0x1.96e6576bb3cb3p+6, 0x1.301708fa78837p-5, 0x1.ff3f31965170ap-2, 0x1.10f162f4e96f6p-1, 0x1.fd922beaf805dp+6, 2, false, 0x1.fd9625d7a9625p+2, 0x1.f6231b491c637p-9, 0x1.28e62e6779913p-3},
+    {0x1.d8928c16dc109p+6, 0x1.07fbc5f370d93p+7, 0x1.4bd981b338fb4p-5, 0x1.c0344f9c1eec8p-2, 0x1.02091cb4474a7p+0, 0x0p+0, 0, false, 0x1.9d71e745c02f3p+4, 0x0p+0, 0x1.10356f860fc8cp-2},
+    {0x1.8d8464bcf7e68p+6, 0x1.b086780fa854p+6, 0x1.cd2b0987a586fp-6, 0x1.4053506dbb6eap-2, 0x1.d1087c65a02f6p+0, 0x1.c9250d72e9e2ap+6, 2, true, 0x1.76042d0955a7ep-7, 0x1.09cfde581fab3p-14, 0x1.071aae75f0291p-9},
+    {0x1.5ed6a3a12b722p+6, 0x1.8e1aa47d13aa1p+6, 0x1.33adb7995b6c1p-5, 0x1.2a573c9afbb8ep-2, 0x1.bfed096bd1cf8p+0, 0x1.9376d5c62529ap+6, 2, true, 0x1.13c92f4a41f6ep-11, 0x1.b7204ce4fee5fp-18, 0x1.b21700130917ap-13},
+    {0x1.621c50125cfc8p+6, 0x1.55badcd515d23p+6, 0x1.38ebc9efd84e6p-5, 0x1.be626e2fc8356p-2, 0x1.33f979bc2ce48p-1, 0x1.2cfe7742cf09dp+6, 3, false, 0x1.0fcbc9dd958p-3, 0x1.19a17e82777c9p-12, 0x1.19b01ec735da5p-7},
+    {0x1.9f89edc0a7578p+6, 0x1.caada5487d554p+6, 0x1.dedb87523bc07p-6, 0x1.08520d24050a4p-2, 0x1.0cadb133acbe1p+0, 0x0p+0, 0, false, 0x1.eb001a2c6f164p+3, 0x0p+0, 0x1.4d63a76170a9fp-3},
+    {0x1.d02079e9d667ap+6, 0x1.c057b6c007cf5p+6, 0x1.c3595fe720b3ep-6, 0x1.4db0443f90c2cp-2, 0x1.58e98f39b79f2p-1, 0x0p+0, 0, false, 0x1.2832c2aff9f5p+3, 0x0p+0, 0x1.11b46e07d0d49p-3},
+    {0x1.4d6b44c2c0695p+6, 0x1.479c1a7b38095p+6, 0x1.d9cdc69f8a82cp-6, 0x1.21b18eb48a44p-1, 0x1.980464b3d89ep-1, 0x0p+0, 0, true, 0x1.1ffd18ed5b2afp+4, 0x0p+0, 0x1.61b94b7f1730bp-2},
+    {0x1.4227234e77782p+6, 0x1.3ab7561495d71p+6, 0x1.11923e3b780ap-5, 0x1.d2298c0b0d998p-2, 0x1.7fe5ac591c577p-2, 0x0p+0, 1, false, 0x1.ffec911b789bfp+1, 0x1.6daa50847d014p-10, 0x1.e7c5204ed011ap-5},
+    {0x1.4ddf93916a93ap+6, 0x1.28562e7b2c2d8p+6, 0x1.2059b68939732p-5, 0x1.01e027f8a9ec5p-3, 0x1.e1531a8ea71efp+0, 0x0p+0, 1, true, 0x1.7502926faabd3p+3, 0x1.3c52fbc23c6e3p-11, 0x1.41ed28f3471fdp-4},
+    {0x1.af7fd8053384fp+6, 0x1.db38a03b1bcd5p+6, 0x1.88510ac812d79p-6, 0x1.547d362610d7cp-3, 0x1.91829c390111p-1, 0x0p+0, 0, true, 0x1.8f814ef62459ap+1, 0x0p+0, 0x1.297070e368ff9p-4},
+    {0x1.c2244cc875bebp+6, 0x1.a8c49c520987p+6, 0x1.a57a648ce07ebp-6, 0x1.dfcb6dfb9ff5ep-4, 0x1.1b117eee2bd38p+0, 0x0p+0, 1, false, 0x1.3c49d96889f22p-1, 0x1.23fd3c366c06ep-11, 0x1.31c8834355749p-6},
+    {0x1.801ff904f2fb6p+6, 0x1.83bc839a4d8fbp+6, 0x1.291997d1962c9p-5, 0x1.0285998a897bep-2, 0x1.d81269dc80d8p-1, 0x0p+0, 1, false, 0x1.3d309a175e408p+2, 0x1.8630d8ef2a3f5p-10, 0x1.17f38c08896c2p-4},
+    {0x1.4f6b3c2702439p+6, 0x1.28d2ee0597f1ep+6, 0x1.b136e59a71c6ap-6, 0x1.dab434846941cp-2, 0x1.ed150f78272f8p+0, 0x1.81bb51f9a900ep+6, 2, true, 0x1.40ca39dfff4b1p-3, 0x1.b3a2954db448dp-12, 0x1.b18c72b3329f7p-7},
+    {0x1.66848371db9d6p+6, 0x1.93e95be99b89cp+6, 0x1.978852a66599p-6, 0x1.8e3ddc54cb614p-2, 0x1.6bdc383064d78p+0, 0x0p+0, 0, true, 0x1.b02452bf71d56p+3, 0x0p+0, 0x1.3270ad4d1b3c6p-2},
+    {0x1.4c361634f8116p+6, 0x1.712906991e634p+6, 0x1.10c0661966e88p-5, 0x1.7bf2b30161c56p-2, 0x1.f8693ce3fa698p+0, 0x0p+0, 1, false, 0x1.ae6e0546bfa5ap+3, 0x1.d03f95d23b0c6p-10, 0x1.19547d61bc418p-3},
+    {0x1.7f20c30346b2fp+6, 0x1.518aca20021d5p+6, 0x1.f796a1236c1d9p-6, 0x1.aff879c22eafp-2, 0x1.ea7abf947692fp+0, 0x0p+0, 1, false, 0x1.7eb010ae36458p+2, 0x1.4133b721cb139p-9, 0x1.90ec10cc03219p-4},
+    {0x1.b83c3fd2459dep+6, 0x1.c07f80c5a93dfp+6, 0x1.2875d59d03387p-5, 0x1.d28e347f72865p-4, 0x1.cc0f62959ed5ap-1, 0x0p+0, 1, true, 0x1.4e6b445eedef2p+1, 0x1.04c2451407995p-10, 0x1.4efa1e2b63a1bp-5},
+    {0x1.a9c23af87da24p+6, 0x1.e2da6f7353948p+6, 0x1.ef65da14b2152p-6, 0x1.0d3da7be8eeb3p-3, 0x1.53e17d8bca2d8p-1, 0x0p+0, 0, true, 0x1.0652b9f39666cp+0, 0x0p+0, 0x1.16af2a571caf7p-5},
+    {0x1.592cbb1b0f9bfp+6, 0x1.4c2a5e8d51672p+6, 0x1.af8ad81bb844ep-6, 0x1.ce0cdbf1e8498p-2, 0x1.7547898a243abp+0, 0x0p+0, 1, false, 0x1.03aaa31b5f297p+3, 0x1.318f68be5f81ep-9, 0x1.c10bbbdf64efcp-4},
+    {0x1.4f44879daac96p+6, 0x1.6888ecc78241p+6, 0x1.651774a955f3bp-6, 0x1.78ff0d0da402ep-2, 0x1.cd8e6da93ddbap+0, 0x1.1cfa4012d12b3p+6, 3, false, 0x1.19844e50c9f1dp-2, 0x1.1178bdd2fba8ap-11, 0x1.11f8cf2db5448p-6},
+    {0x1.c3e9244b173bdp+6, 0x1.8d9413b269e65p+6, 0x1.70474a69b261dp-5, 0x1.798558ceebbfp-2, 0x1.a0345653a4142p-1, 0x1.03d941ab2d5cp+7, 2, true, 0x1.1e4d4be7281eap+0, 0x1.481c08c750042p-10, 0x1.49120e23d1944p-5},
+    {0x1.db037be6a7864p+6, 0x1.e1f13299cbe54p+6, 0x1.d79b9538e4p-6, 0x1.027d690f8634fp-1, 0x1.2551b6d12c3e8p-1, 0x1.112200d7d386cp+7, 2, false, 0x1.98aed2a7f3191p+3, 0x1.52d99e4e48fp-8, 0x1.a8cd60f97fcc4p-3},
+    {0x1.7966071e177bfp+6, 0x1.977855caf4815p+6, 0x1.50da0b54cfea1p-5, 0x1.76474245ee674p-2, 0x1.4489a4cb72b4ap-1, 0x0p+0, 0, false, 0x1.ba0d9190c2242p+3, 0x0p+0, 0x1.38a4225c44cd5p-3},
+    {0x1.8da80e755712ep+6, 0x1.99cf5ad2553a4p+6, 0x1.95a7827cd9005p-5, 0x1.14f461ab7f5f3p-3, 0x1.eea2d8c43557cp-1, 0x1.c94e10a08a88ep+6, 2, false, 0x1.1369ffd3abe3cp+2, 0x1.979231b6f2225p-10, 0x1.0ba0aedf650c6p-4},
+    {0x1.5d9491b5eab7ap+6, 0x1.5fc402017bb93p+6, 0x1.db64f6f49e87ap-6, 0x1.910c9b285a416p-3, 0x1.7b2fe7255209ep+0, 0x0p+0, 1, false, 0x1.04c2db26a3bdbp+2, 0x1.5cd2b2d6a3569p-10, 0x1.dfd2ea9b2e191p-5},
+    {0x1.74e4c2e1461b8p+6, 0x1.70c58e5d2e1b1p+6, 0x1.779cb0d550b04p-5, 0x1.40ad1dea91adep-2, 0x1.2633d8039bcc6p+0, 0x1.acd3e01caa393p+6, 2, true, 0x1.afd82ee1ee1f6p-3, 0x1.9cda990392adfp-12, 0x1.9dc7cac146132p-7},
+    {0x1.64a143ed04accp+6, 0x1.4a529dc0cd583p+6, 0x1.66dc5d3a82524p-5, 0x1.c8860ed91cbcp-3, 0x1.50576006147bp-2, 0x1.2f22acefdd92dp+6, 3, true, 0x1.2658e7f44c434p+3, 0x1.846b06990d212p-10, 0x1.8756e3b4e9e4fp-4},
+    {0x1.92ca7edb6cf7bp+6, 0x1.58c448af687d5p+6, 0x1.304dcabba15p-5, 0x1.3456ab33274d9p-3, 0x1.e5db92bb91e61p-1, 0x0p+0, 1, true, 0x1.f9e3a29b0b8fdp+3, 0x1.a5c8697f62c6dp-12, 0x1.5732d91eaac46p-4},
+    {0x1.5116a62f310f1p+6, 0x1.247e045e9a6d7p+6, 0x1.819c18557b878p-6, 0x1.d2f42a11fce22p-2, 0x1.d4b7fa6c34ebp-2, 0x1.1e8673a81ce66p+6, 3, false, 0x1.da37f768bc9fbp-10, 0x1.b440be61a6176p-17, 0x1.af87014570aabp-12},
+    {0x1.b515c2b96b6adp+6, 0x1.a4e13e03b8ec3p+6, 0x1.986f3a6326e13p-5, 0x1.0b6242f08863cp-1, 0x1.305604e95aa6dp+0, 0x0p+0, 1, false, 0x1.489e993b6a9a9p+3, 0x1.8834f23713a76p-9, 0x1.1dfc1d2c0a896p-3},
+    {0x1.9df2e0504c214p+6, 0x1.62c2a4233e6bap+6, 0x1.22497b01fdae1p-5, 0x1.5ba4e99529a0ap-2, 0x1.40b842df2739ap-1, 0x0p+0, 1, false, 0x1.0b7e812cb3d71p+0, 0x1.eacf709d6abdfp-11, 0x1.012ced933f388p-5},
+    {0x1.5ab4c78e6bd1ap+6, 0x1.27949b0b2b09fp+6, 0x1.4a482242fd677p-5, 0x1.4a1685a404a25p-2, 0x1.e501bd3140d1ap+0, 0x0p+0, 0, true, 0x1.890ea69187a92p+4, 0x0p+0, 0x1.64264603413d3p-2},
+    {0x1.a672defbdbdf2p+6, 0x1.982c58e337c72p+6, 0x1.b1236093995dap-6, 0x1.a14d6c231be8ep-3, 0x1.04dcc97a26494p+0, 0x1.e5d0e6d4d673cp+6, 2, true, 0x1.1331097cee956p+0, 0x1.f54d9121587f1p-11, 0x1.ff72c324d4246p-6},
+    {0x1.6d2847d70741dp+6, 0x1.753571aaef12fp+6, 0x1.486dbc35fb9f5p-6, 0x1.2fe7b8ced17afp-2, 0x1.40facf47c342p+0, 0x0p+0, 0, false, 0x1.7c0c414c6f677p+3, 0x0p+0, 0x1.299ef72a47928p-3},
+    {0x1.8f60c4bc53feep+6, 0x1.8e2fcf7c33918p+6, 0x1.e8aaf06582311p-6, 0x1.2e61d4b5ffadbp-2, 0x1.54981064b5b34p-1, 0x1.5378a739adcbdp+6, 3, true, 0x1.3a1b6c740c888p+3, 0x1.1d690b5062757p-8, 0x1.5a5b15c400cccp-3},
+    {0x1.90f076c649c29p+6, 0x1.ae8c4d4806427p+6, 0x1.394ba975d34f7p-5, 0x1.57e16034d1bdp-2, 0x1.11fa83ca1f20ep-1, 0x1.54cc64f5584bcp+6, 3, true, 0x1.cc00bf096610fp+2, 0x1.0d30a6adf3bc4p-8, 0x1.30072c359d948p-3},
+    {0x1.43a6e6f632677p+6, 0x1.66246956642e5p+6, 0x1.206e880067259p-5, 0x1.41634504c10ep-2, 0x1.33da3a5627cc8p+0, 0x1.131aaab7aad7fp+6, 3, false, 0x1.b76759df56a4cp-1, 0x1.eca8e4cee599dp-11, 0x1.eb0089cd21f1cp-6},
+    {0x1.b61d5fa1732c4p+6, 0x1.89b3fa936ef46p+6, 0x1.134d7df6a00fbp-5, 0x1.c2ff73dd8c3fep-3, 0x1.c7319ea528d5bp+0, 0x1.7465c47c6eb26p+6, 3, true, 0x1.284818c096da7p+4, 0x1.b31bb1ac66498p-8, 0x1.1d9c20ed0fb8bp-2},
+    {0x1.6515ccc6bba94p+6, 0x1.50c76a559a70dp+6, 0x1.9473712d88b0cp-5, 0x1.04010fb2da5a6p-1, 0x1.7405881f6e8a2p-2, 0x0p+0, 0, true, 0x1.c229720d4e447p+3, 0x0p+0, 0x1.b2f67a00051fp-3},
+    {0x1.be9ee53f39d47p+6, 0x1.d2343519a78b6p+6, 0x1.7af2b88bd70aap-6, 0x1.5733220026497p-2, 0x1.fb648453aaad9p-1, 0x1.00ce909df473cp+7, 2, false, 0x1.81a32477e58p+3, 0x1.26cdcb000e7bep-8, 0x1.7d960cf9e01e2p-3},
+    {0x1.a33c1c0b67783p+6, 0x1.6ecbf14763e8dp+6, 0x1.e54be6366364dp-6, 0x1.241883a4aaacbp-1, 0x1.e66b1deba7daep-2, 0x0p+0, 0, false, 0x1.2207017ed1195p+3, 0x0p+0, 0x1.1ca7f059ea6c5p-3},
+    {0x1.a162754a8e369p+6, 0x1.d1d7bf1071b4fp+6, 0x1.d0264686b365ep-6, 0x1.2a5fc929598fcp-1, 0x1.0de2f05fcfcb1p+0, 0x0p+0, 1, false, 0x1.4b1624ee3310ap+4, 0x1.26f0fa9f2c9d8p-9, 0x1.9b1ac4b1bcfc8p-3},
+    {0x1.4b0cbe92118f5p+6, 0x1.23153d30daf0fp+6, 0x1.c2da2dd22c347p-6, 0x1.9c6a5e608ee4ap-3, 0x1.a298bd2bbde01p+0, 0x1.19646ec8f5537p+6, 3, true, 0x1.bddafb948a928p+3, 0x1.113d993a19b7p-8, 0x1.843f2b3739d03p-3},
+    {0x1.64ff64f6d5d77p+6, 0x1.411d0aeb27468p+6, 0x1.af307ab3b18c3p-6, 0x1.59a1ece3fd2e3p-2, 0x1.09a9a109f0504p+0, 0x0p+0, 0, false, 0x1.ac5a9617c7af3p+2, 0x0p+0, 0x1.b367370dd6436p-4},
+    {0x1.65beab0853efap+6, 0x1.62c2e0de4952bp+6, 0x1.9523d4e5fa7bep-5, 0x1.946be8e106e6ap-3, 0x1.9b0e181d2cc92p-1, 0x0p+0, 0, false, 0x1.121cab1b74185p+2, 0x0p+0, 0x1.18625da76c491p-4},
+    {0x1.8653930b6e24p+6, 0x1.590b4705c1a07p+6, 0x1.d9970fea6e3b3p-6, 0x1.1e61d897fbb7ep-1, 0x1.70620103bfe88p+0, 0x1.4bc709c9b7383p+6, 3, false, 0x1.f02143886b487p-10, 0x1.48b51a9cf0f75p-16, 0x1.44fbec5028826p-11},
+    {0x1.a1c7bbc7634a2p+6, 0x1.bd56c783851a2p+6, 0x1.045b8ea9108a3p-5, 0x1.c8b942bd820c8p-3, 0x1.25837bbd697ffp+0, 0x0p+0, 1, true, 0x1.e3ad2237ce4f7p+1, 0x1.13ebb1b40beb2p-9, 0x1.3988b8b788635p-4},
+    {0x1.970e3ff364744p+6, 0x1.ae196431f9753p+6, 0x1.62ac3992536f6p-6, 0x1.2d2030b94dd11p-1, 0x1.af6dadcae0a9p+0, 0x0p+0, 1, false, 0x1.3dbbe8c2fc32fp+4, 0x1.608066ec0b2c8p-9, 0x1.a68d5bc1e5a93p-3},
+    {0x1.47c3e3abb28c5p+6, 0x1.3b08e39a10d48p+6, 0x1.80c91874782d5p-5, 0x1.6dda9fcbb3dfcp-2, 0x1.604edb9a5b8a6p+0, 0x1.1699b4b857c41p+6, 3, false, 0x1.0bf87b314fa0ep-4, 0x1.74afb317935f9p-13, 0x1.72c7c22678cp-8},
+    {0x1.d57b4c8c85497p+6, 0x1.c8471a9d249efp+6, 0x1.79aa4561b06c8p-6, 0x1.7b54978bc9e1ep-2, 0x1.257f02af747c2p-1, 0x0p+0, 0, false, 0x1.520aa9dc7697dp+3, 0x0p+0, 0x1.2b7906294e016p-3},
+    {0x1.4f67d86c8186p+6, 0x1.4c8755609ccbcp+6, 0x1.35690962f17fcp-5, 0x1.d35de1aacc852p-2, 0x1.ee30a4678b6abp-1, 0x0p+0, 1, false, 0x1.d7dad42b05d7ep+2, 0x1.08896a94f1f7dp-9, 0x1.8f4fa27dd8e51p-4},
+    {0x1.6145415cb542dp+6, 0x1.6b024fd26b151p+6, 0x1.3cc3e139fe779p-5, 0x1.07b48bd4bd83p-1, 0x1.548dd2ada023bp+0, 0x1.9642d7f76a0cdp+6, 2, true, 0x1.9a44f9365cdc5p-6, 0x1.fee379391f78fp-14, 0x1.f9ee8d3a4565dp-9},
+    {0x1.b61c3b34196dep+6, 0x1.875dac4d5aa68p+6, 0x1.af93f61ed4546p-6, 0x1.e4942d899d06cp-2, 0x1.4268087d05779p+0, 0x0p+0, 1, false, 0x1.b41a53286cf4p+2, 0x1.6687d3e6ade71p-9, 0x1.c308a61daaf28p-4},
+    {0x1.6bd40f5d8a3e8p+6, 0x1.634b3a9276581p+6, 0x1.56d0ac6ca66aep-5, 0x1.6aec426dce106p-2, 0x1.0fe6268d97e18p-1, 0x0p+0, 1, false, 0x1.f16ed1adf25bfp+1, 0x1.7ed1093ab76adp-10, 0x1.ee6f1b1e9b99ap-5},
+    {0x1.a6132b5521c6fp+6, 0x1.875667020213p+6, 0x1.6b3495bd565acp-6, 0x1.11eae947ec6d7p-2, 0x1.759dfe10ff1c7p+0, 0x0p+0, 0, true, 0x1.2f462fc96e207p+4, 0x0p+0, 0x1.19f729488c1f3p-2},
+    {0x1.a12620e41171bp+6, 0x1.d836e571fa521p+6, 0x1.12d4866a9ac3fp-5, 0x1.ab5b3ba8e0ee6p-2, 0x1.ed87ef2d0dff8p+0, 0x1.dfb8a5d3140f8p+6, 2, false, 0x1.db5749e2604dbp+3, 0x1.c3a0deedf68edp-8, 0x1.0e0ad0385a439p-2},
+    {0x1.a640758e01c8fp+6, 0x1.8dc9fde93b7cp+6, 0x1.45659bbd0dfa2p-5, 0x1.4cbfd5b9408acp-2, 0x1.1247ad66d8eb2p-1, 0x1.66e9fd8581846p+6, 3, false, 0x1.84e8e0ad378fdp-3, 0x1.42e2ea273ce98p-12, 0x1.45174a8283c2dp-7},
+    {0x1.6892e2f378ac9p+6, 0x1.72376a43ddb1p+6, 0x1.c3ce86efeabbdp-6, 0x1.e86329a36bc3cp-3, 0x1.d89d601d5ebf6p+0, 0x0p+0, 1, false, 0x1.aa810b96bf8ecp+2, 0x1.c09481d40409ap-10, 0x1.5f0a0634bf851p-4},
+    {0x1.6806f0aabf8b1p+6, 0x1.97a083bcddf3bp+6, 0x1.e9322990971dbp-6, 0x1.ffb554fb50396p-2, 0x1.fd8fd191cd9eap+0, 0x0p+0, 1, false, 0x1.3c1ff17a90603p+4, 0x1.08f966fd069f6p-9, 0x1.8448a488e99efp-3},
+    {0x1.d9e42b690ad5dp+6, 0x1.a7fd769d9fca4p+6, 0x1.37ee67dfaf9c2p-5, 0x1.32931690b71c7p-2, 0x1.bb9e658b9a728p+0, 0x0p+0, 1, true, 0x1.34becfb3ea97bp+4, 0x1.1c717d92c4846p-8, 0x1.d4a5d7d53bb71p-3},
+    {0x1.c86a276c2cdebp+6, 0x1.b0e47de393576p+6, 0x1.68f1eee0bd6dp-6, 0x1.26299d8bb8d66p-1, 0x1.344247f379945p-1, 0x1.83f3d4b58c8a1p+6, 3, true, 0x1.08f0af9231221p+4, 0x1.6e38b759e0c2cp-7, 0x1.8fa8486716f7dp-2},
+    {0x1.8f579332394f5p+6, 0x1.62d53afda392ep+6, 0x1.ba5c945f3be55p-6, 0x1.0282d2989d282p-1, 0x1.c9fdd94cbb68fp+0, 0x0p+0, 1, false, 0x1.0e2b6aa3e3e89p+3, 0x1.7b38a3b2fe66ep-9, 0x1.fdedd9cf87006p-4},
+    {0x1.8cbb6dde7940dp+6, 0x1.c0d55738a899ep+6, 0x1.eaf2ee20d1e8p-6, 0x1.53834b60d69a8p-2, 0x1.7c111b7f48c9p+0, 0x1.c83df18ca50a8p+6, 2, true, 0x1.aa56e175be147p-11, 0x1.42b4af9a07d49p-17, 0x1.3f04018239e77p-12},
+    {0x1.557d1c84aebfp+6, 0x1.5fe7f165331b4p+6, 0x1.991644430cbb8p-5, 0x1.41bf66c33ddb2p-2, 0x1.c899c3e6bccf5p+0, 0x0p+0, 0, false, 0x1.6f00db1d39533p+3, 0x0p+0, 0x1.2c559b8b76ap-3},
+    {0x1.c1a2dde9c7989p+6, 0x1.ffee92773dc7fp+6, 0x1.5e23572a01acdp-6, 0x1.073d1f36bd998p-2, 0x1.917761993646fp+0, 0x1.028a72ccd2c48p+7, 2, true, 0x1.096c20bb900d4p-11, 0x1.adc3bc2be7cffp-18, 0x1.a8d4c39041922p-13},
+    {0x1.ddfb0e951ec5ap+6, 0x1.d89923b864d96p+6, 0x1.c76354779badap-6, 0x1.38531966e7668p-2, 0x1.18207db9a6a9p+0, 0x0p+0, 1, true, 0x1.4770635d66b43p+3, 0x1.ea53e55522cffp-9, 0x1.4050bca1adfc4p-3},
+    {0x1.ba47a84e22e6cp+6, 0x1.d6bf4abf0f04cp+6, 0x1.1d3bcfce891c8p-5, 0x1.9ba1c2560885ap-4, 0x1.bed57c88d4eedp+0, 0x0p+0, 0, true, 0x1.71327ab53d2b8p+2, 0x0p+0, 0x1.79599de2bcdeap-4},
+    {0x1.aa3a92ac7a86cp+6, 0x1.8d2fde795237ap+6, 0x1.a4f6e878b90ebp-6, 0x1.6eca9d2a834dep-2, 0x1.2e15b52d1ce31p-1, 0x0p+0, 0, true, 0x1.01797817fab69p+4, 0x0p+0, 0x1.d5e4b30b80646p-3},
+    {0x1.41c49871a8d05p+6, 0x1.43ad113618e07p+6, 0x1.873cf2ac4adb3p-5, 0x1.12ae00faa38c5p-1, 0x1.d50eb8050e53fp+0, 0x0p+0, 1, false, 0x1.68503fea31dd6p+3, 0x1.31731ef7446bep-9, 0x1.11c909b4ea31fp-3},
+    {0x1.5f6eb9c6b1ea1p+6, 0x1.7c3eb2d668bffp+6, 0x1.08b3b78c6f4d9p-5, 0x1.9993e7e29d342p-3, 0x1.17462e11462cep+0, 0x1.9425bc0ae6339p+6, 2, false, 0x1.0bd81ea828d5dp+3, 0x1.2ec7a66755fe4p-9, 0x1.c44a18fe6064fp-4},
+    {0x1.92ff419973af5p+6, 0x1.62bbec19e237cp+6, 0x1.3ba7350888098p-5, 0x1.d52fd2aa26169p-3, 0x1.65ba24a30b8cfp+0, 0x1.cf72583d45099p+6, 2, true, 0x1.92e06e60571ebp+0, 0x1.6c4cc15caa505p-10, 0x1.6744b1959c44ep-5},
+    {0x1.8325a51884773p+6, 0x1.8d9da5f924d58p+6, 0x1.5c803b62b1b47p-5, 0x1.b06b2871bb028p-3, 0x1.7bc25d51ccedp+0, 0x0p+0, 1, false, 0x1.57a8a156bd19ep+2, 0x1.969703bc17778p-10, 0x1.29d39e5f55013p-4},
+    {0x1.7e55a413568f3p+6, 0x1.aadadee751fb8p+6, 0x1.c5468ff651dcep-6, 0x1.c7bf774db2e14p-3, 0x1.765ff3b5455ap+0, 0x0p+0, 0, false, 0x1.ccd21b3bd2136p+3, 0x0p+0, 0x1.37c39cab2225p-3},
+    {0x1.cb2c2b6d6d376p+6, 0x1.8ae2e48d7c641p+6, 0x1.67da962da041p-6, 0x1.2235362330b91p-1, 0x1.609607d77228bp+0, 0x1.080632921eccap+7, 2, false, 0x1.56f3f0df7a9e4p+3, 0x1.77c5e13da0c0cp-8, 0x1.af5c1d786764dp-3},
+    {0x1.c83b9aa517fb3p+6, 0x1.af226bb11d59ep+6, 0x1.4f7319e73ee6cp-6, 0x1.c36eae2ebc22p-2, 0x1.e45692c15bfc9p+0, 0x0p+0, 1, false, 0x1.6805759703ca6p+3, 0x1.a9e24891271ebp-9, 0x1.380ad75a603dfp-3},
+    {0x1.497a1587805d8p+6, 0x1.6a837581ee1a6p+6, 0x1.400ade5d6fdcp-5, 0x1.1a69d075ebcbcp-2, 0x1.08bbff7e3a64ep-1, 0x1.7ae5ff28a06b8p+6, 2, true, 0x1.bc55606a900e5p-6, 0x1.498e6413c834cp-14, 0x1.479b03d502717p-9},
+    {0x1.d320fdea96e8ep+6, 0x1.e51988f76e1b6p+6, 0x1.85a201378cfefp-5, 0x1.bcd5cfac6b33p-2, 0x1.0b57f894ffc3ep-2, 0x0p+0, 0, true, 0x1.20b4b188180cdp+3, 0x0p+0, 0x1.4de24af634cacp-3},
+    {0x1.6a2c01d84e48cp+6, 0x1.36ddf30f1d75ap+6, 0x1.9989c1f4fa017p-6, 0x1.2aee6c4df180cp-2, 0x1.9dd8b54c8dd93p+0, 0x1.33d89b2b0f577p+6, 3, true, 0x1.014405db4e5b2p+4, 0x1.f78479ecb19c2p-8, 0x1.2a4d1f44a73d7p-2},
+    {0x1.96000bc6de9dfp+6, 0x1.632d413082bb1p+6, 0x1.1996c428ea201p-5, 0x1.8c82fa9f15f98p-2, 0x1.585ac2b5b42d1p+0, 0x0p+0, 1, false, 0x1.f58ff612463bap+1, 0x1.08d3c60864a3p-9, 0x1.33006540052bcp-4},
+    {0x1.dc97585bd2b37p+6, 0x1.c4d494920bc05p+6, 0x1.a6eedb8176315p-6, 0x1.edc0edfb3966ep-2, 0x1.d9483ceb9b6ffp+0, 0x0p+0, 1, false, 0x1.9ef46492da92cp+3, 0x1.ca223aa63ed9bp-9, 0x1.5ce6a0b6eb8a9p-3},
+    {0x1.c4214d1724ae3p+6, 0x1.ad92e7c0d596ap+6, 0x1.9c80a0d43711fp-6, 0x1.16fb11682c8c1p-3, 0x1.eb6a10cda168dp-1, 0x1.03f98c53b5175p+7, 2, false, 0x1.494b8114cb88bp+1, 0x1.7c7b9249c8683p-10, 0x1.af085be40f1c9p-5},
+    {0x1.6aba49dd08d12p+6, 0x1.69d73d41229ap+6, 0x1.b48e78283fbafp-6, 0x1.e49f6ad539b44p-4, 0x1.8abc2a28ef39cp+0, 0x0p+0, 1, true, 0x1.087c1d2da840fp+2, 0x1.24026b54be5b1p-10, 0x1.ba69b54dbec3ap-5},
+    {0x1.7c66e380dd0b5p+6, 0x1.4e5504cd9541p+6, 0x1.19a3d24258796p-5, 0x1.e1cf670d6b77ap-2, 0x1.3d9220ff7e0f4p-1, 0x1.43577493ef167p+6, 3, true, 0x1.edc19a13e48cp+3, 0x1.02b565bb2e0eap-7, 0x1.2c8966d5e4e8ep-2},
+    {0x1.83500fc84a5fp+6, 0x1.a0f71881556bdp+6, 0x1.63a93bd40cd7fp-5, 0x1.b477c3da41906p-3, 0x1.8a7cab2a98fd2p+0, 0x1.bd68def32253ap+6, 2, true, 0x1.8a8408a02fb07p-5, 0x1.19552b87eddf9p-13, 0x1.17cd509ab5066p-8},
+    {0x1.47a33f5da14abp+6, 0x1.52e30bdb52798p+6, 0x1.43fbef7b24e26p-5, 0x1.39cc70c707eaep-2, 0x1.a2495cbee6cadp+0, 0x0p+0, 0, false, 0x1.6a3669b744839p+3, 0x0p+0, 0x1.20230ca5086c8p-3},
+    {0x1.5d7b27c566b7p+6, 0x1.7fb379a66a682p+6, 0x1.4b70e877ce2cfp-5, 0x1.177bc71e37e3fp-3, 0x1.54551f5b01596p+0, 0x0p+0, 0, false, 0x1.e2012f63435e6p+2, 0x0p+0, 0x1.5d274fd114ee9p-4},
+    {0x1.772baef0e5415p+6, 0x1.61637b2eb16c5p+6, 0x1.ccd199bc75da6p-6, 0x1.449561841ae04p-3, 0x1.b15d1029c56d2p-1, 0x0p+0, 1, false, 0x1.a8428f664eba8p-1, 0x1.49fc9c93f75c8p-11, 0x1.613aa3f9b926dp-6},
+    {0x1.5eec0edee8c8fp+6, 0x1.37febe64f296ap+6, 0x1.4642f8f3fbe15p-5, 0x1.27d6b569fa58ep-2, 0x1.52d511105296ep-1, 0x1.938f77805880ap+6, 2, true, 0x1.be446c8428e98p+0, 0x1.699ab7c7a2894p-10, 0x1.58dd057279409p-5},
+    {0x1.9ec4e99f4d483p+6, 0x1.c1d3e2db201e5p+6, 0x1.1f617878f7a63p-5, 0x1.40c94c8432fa3p-2, 0x1.f1d14b7da62afp-1, 0x1.dcfc0caa65ac9p+6, 2, false, 0x1.79e48f0cc6463p+3, 0x1.0d0b34fb26625p-8, 0x1.66e656bccf47p-3},
+    {0x1.8dcb7cbffd6f7p+6, 0x1.9a02c363e48bbp+6, 0x1.878fe72b6693dp-5, 0x1.72952d5158ebcp-2, 0x1.00612f2360abfp-1, 0x0p+0, 1, true, 0x1.43948420c1519p+2, 0x1.3199ae3cc6b35p-9, 0x1.6e2eac6f1acaap-4},
+    {0x1.d3d0d96fa0cd1p+6, 0x1.da24380713461p+6, 0x1.e229f03c7c805p-6, 0x1.73f41d4127544p-3, 0x1.ac062328bab52p-1, 0x0p+0, 1, false, 0x1.217141d103b6cp+2, 0x1.5a10a652d2e41p-10, 0x1.f80c9eafbef8dp-5},
+    {0x1.ced752ff624c8p+6, 0x1.0483d8f4399b8p+7, 0x1.64557a558cecap-5, 0x1.49fad1609cb26p-2, 0x1.10c3cbfef20edp+0, 0x1.896a39bf79f43p+6, 3, true, 0x1.4c534e7b17fbap+3, 0x1.c3b707307da9cp-8, 0x1.ee78434e1f07bp-3},
+    {0x1.9bda96c0a64fcp+6, 0x1.cb328b3937a7p+6, 0x1.c3c363b83f92ep-6, 0x1.2769b08555b3p-3, 0x1.bc32e130f39fbp-1, 0x0p+0, 0, false, 0x1.6dc5564409904p+3, 0x0p+0, 0x1.a772f3671934bp-4},
+    {0x1.6007c077f4fccp+6, 0x1.5600a165367bep+6, 0x1.2845623d94cecp-5, 0x1.4b1d2e84f6d23p-2, 0x1.db0d475d8fb1bp+0, 0x0p+0, 1, true, 0x1.6878087ab6c76p+3, 0x1.0af9bc081efc2p-8, 0x1.5e51d7b260414p-3},
+    {0x1.848d68a47b40ep+6, 0x1.8aa5b2cd8df73p+6, 0x1.32733eecf2b6fp-5, 0x1.2905354988036p-2, 0x1.319f58ac8cfcp-2, 0x1.bed5d1f05a8a9p+6, 2, false, 0x1.893d2c2b80d04p+2, 0x1.d8fa65fab4a74p-10, 0x1.5732a531da78p-4},
+    {0x1.80d3eb115dba2p+6, 0x1.9c2c6a1c0757cp+6, 0x1.008c41f4126fap-5, 0x1.f0f7b3b22e533p-3, 0x1.21bf9da3b975cp-2, 0x1.ba8d4e53f896p+6, 2, false, 0x1.0ccdefc862c96p+3, 0x1.4f799b7421d8bp-10, 0x1.66b19c70d0714p-4},
+    {0x1.daa0a44e9c754p+6, 0x1.c3f58a3f12ebep+6, 0x1.6324c99e7504cp-5, 0x1.cdd0c51726521p-3, 0x1.b7cedbda384aep-2, 0x1.936ef20f9e96ep+6, 3, true, 0x1.6587c65d24408p+3, 0x1.5957e262a5bebp-9, 0x1.180834479af0bp-3},
+    {0x1.9cdcf0228f68ap+6, 0x1.63ab472c5932bp+6, 0x1.c668b11fb6055p-6, 0x1.57ac9ab7c1deap-2, 0x1.c92d135451062p+0, 0x0p+0, 0, true, 0x1.b899b98c9bba9p+4, 0x0p+0, 0x1.a4246075102c5p-2},
+    {0x1.d07f0d8f380a4p+6, 0x1.dd69d3062ce42p+6, 0x1.b7e8b021bfa2cp-6, 0x1.f7c2532958038p-2, 0x1.635c722069c29p-1, 0x1.0b15daff269f8p+7, 2, false, 0x1.aa1037c5829c2p+3, 0x1.65ed6432fa53bp-8, 0x1.be7d8fa4746dep-3},
+    {0x1.8c1d6995eb642p+6, 0x1.aef8ff1890fb4p+6, 0x1.3d30bd0aae7cfp-5, 0x1.d284e28b694ebp-3, 0x1.627d695bc5d33p-1, 0x0p+0, 1, false, 0x1.1eabb1d251f63p+3, 0x1.c46d26c882d17p-11, 0x1.4bba05e35c092p-4},
+    {0x1.8f9394410c27cp+6, 0x1.6ccccea49b6cdp+6, 0x1.2c96e0c2e9026p-5, 0x1.3de07728a46bfp-3, 0x1.c06dc394102d9p+0, 0x0p+0, 0, true, 0x1.0d40699c42198p+4, 0x0p+0, 0x1.6c3eda8cf6548p-3},
+    {0x1.9d8c066fb2eb7p+6, 0x1.779e03ea567fbp+6, 0x1.cde10447a1c0ap-6, 0x1.0c44cdff36cf5p-2, 0x1.9d8e34dde2ebdp+0, 0x0p+0, 1, true, 0x1.cafd54297c04bp+3, 0x1.8fdb4d7ec5d0ep-9, 0x1.54c37a818695fp-3},
+    {0x1.bd6756494c1eep+6, 0x1.eb57d08e3e32ap+6, 0x1.84589e0e41d94p-5, 0x1.cb8a889ab3d2cp-2, 0x1.e075ff1b986e8p-1, 0x0p+0, 1, false, 0x1.0491aaa79b16p+4, 0x1.16c21e4a3f7a2p-9, 0x1.5235885d8ed71p-3},
+    {0x1.a600240d7a692p+6, 0x1.a4ae12e6c17f1p+6, 0x1.d0c6a2c3b9839p-6, 0x1.5a4192705fceep-3, 0x1.5a8949b33ef3bp+0, 0x1.66b351d841a62p+6, 3, false, 0x1.ba70d0102d3c4p-1, 0x1.892e5409569e5p-11, 0x1.9d89969a2a2f5p-6},
+    {0x1.d764c1318d055p+6, 0x1.ff65a8221e4b4p+6, 0x1.461e53cf754eep-5, 0x1.12eb440a2c50ep-1, 0x1.4207a668f4133p+0, 0x0p+0, 1, false, 0x1.418c76060edbap+4, 0x1.70b6097d3d7f9p-9, 0x1.ad9086b316148p-3},
+    {0x1.d16300e651e6bp+6, 0x1.92c7c83611068p+6, 0x1.647eb4f515dp-5, 0x1.2e88cf2ccceeep-2, 0x1.ea98dbc69c6fp-1, 0x1.0b98ed513be4ap+7, 2, false, 0x1.0b42493f3d4bcp+2, 0x1.53cb334185b6ep-9, 0x1.78d7b443f7dc7p-4},
+    {0x1.d99dbc3cb6af9p+6, 0x1.dbda5a3a18ad4p+6, 0x1.5fd9d9acc4dc7p-6, 0x1.b77fb8fca8f26p-3, 0x1.b46981f9a8322p-1, 0x0p+0, 0, true, 0x1.433f17f6e3423p+3, 0x0p+0, 0x1.4637a747918bbp-3},
+    {0x1.4e8527518bcb2p+6, 0x1.5a350b84ee461p+6, 0x1.13c70b0009a57p-5, 0x1.f47f963a3c074p-2, 0x1.bb85e95416666p-1, 0x0p+0, 0, true, 0x1.dbdb0d912592dp+3, 0x0p+0, 0x1.2b38fb192530ap-2},
+    {0x1.84609ef18898ap+6, 0x1.919890a72c5bbp+6, 0x1.02bf805d6b3d5p-5, 0x1.4773e2297672ap-2, 0x1.54e4b8478964dp-2, 0x1.bea2506290491p+6, 2, false, 0x1.f5686aa3bcc7ap+2, 0x1.1664b227a25c2p-9, 0x1.a4f29b58f14aep-4},
+    {0x1.a0c90f2ad58f4p+6, 0x1.8a97749c3c558p+6, 0x1.ed95cc5c236bep-6, 0x1.4bcd5fa48f2bp-2, 0x1.f8da5e3dc6777p-2, 0x1.624480179becfp+6, 3, false, 0x1.e5e04ca6233bap-3, 0x1.6d3d43baa9b7ep-12, 0x1.713601d289f0cp-7},
+    {0x1.4a57e8e6decd2p+6, 0x1.793d7ae56183ep+6, 0x1.8c4c297e77576p-5, 0x1.f3568e9cfa99ap-2, 0x1.c5929625ac7d7p+0, 0x0p+0, 0, true, 0x1.39668cf230ab2p+4, 0x0p+0, 0x1.d7d9f93b73703p-2},
+    {0x1.698a635e8aac6p+6, 0x1.3efca4fa03623p+6, 0x1.8feb6c9b68274p-5, 0x1.af297b5b3433p-2, 0x1.a90d9feb64ffdp+0, 0x1.9fc58bdfec463p+6, 2, false, 0x1.9cee428c8bfdfp+2, 0x1.e2a070ee7e4c4p-9, 0x1.10a1911267f08p-3},
+    {0x1.8ded09c9e0039p+6, 0x1.8b8f0dd4666d4p+6, 0x1.91abdf2f0a508p-5, 0x1.5f56463ddc414p-2, 0x1.8d520471709b2p+0, 0x1.c99d64db5b374p+6, 2, true, 0x1.d516e8e234b8cp-4, 0x1.385afba4687b7p-12, 0x1.36f2345db6ad1p-7},
+    {0x1.d3fdcecccf018p+6, 0x1.eb56d40233cdfp+6, 0x1.60ffdffbc21e2p-5, 0x1.ed81af24930dep-4, 0x1.74c23106f9ffcp+0, 0x1.8dcaefc7aff47p+6, 3, false, 0x1.6cd98da5f472fp+1, 0x1.5b0453ca898c6p-10, 0x1.9ee05c47653cap-5},
+    {0x1.d71a1e68605ddp+6, 0x1.0b6e871bd4253p+7, 0x1.4ebe046bbcfb2p-5, 0x1.289eba565785dp-1, 0x1.a73cf5ab90f31p-2, 0x1.0ee237e26a9c5p+7, 2, false, 0x1.19e540fe26f65p+4, 0x1.8c93318e5d5cep-8, 0x1.09a7e7c585eabp-2},
+    {0x1.b22859aca6b4p+6, 0x1.978ba5cdd9c6cp+6, 0x1.688ed43d9169ep-5, 0x1.2db40b678bcdap-1, 0x1.3f74721d1081bp+0, 0x0p+0, 0, true, 0x1.0728540358acep+5, 0x0p+0, 0x1.555e323260f6ep-1},
+    {0x1.a39eb60c6e527p+6, 0x1.8dc62fe78de6fp+6, 0x1.3dce1f28b3e37p-5, 0x1.34074857b21f4p-2, 0x1.ef709e1d83091p+0, 0x1.e2901e27e5453p+6, 2, false, 0x1.dfd30f4e336eap+2, 0x1.022b083440859p-8, 0x1.29c3fd5ef89cp-3},
+    {0x1.8bb85e6d3c872p+6, 0x1.b3a7361faf044p+6, 0x1.9661e346523d6p-6, 0x1.87238bacc96a6p-2, 0x1.889ee38e6cf78p-1, 0x1.505cb6a9a6a61p+6, 3, false, 0x1.166a9894ebc8cp+0, 0x1.31add879d49f4p-10, 0x1.31e0e7e766a2ap-5},
+    {0x1.dabecd6af9a8dp+6, 0x1.e2786ef1919e2p+6, 0x1.5278fc559000ap-6, 0x1.567be3d0520f1p-3, 0x1.48588280f620ep-1, 0x0p+0, 0, true, 0x1.8b31e9870db36p+2, 0x0p+0, 0x1.96ec00b222499p-4},
+    {0x1.4407eb2a51917p+6, 0x1.437f950b2549dp+6, 0x1.53cf999230361p-6, 0x1.d43bf5bf3d954p-2, 0x1.79b3de72ff4e5p+0, 0x0p+0, 0, false, 0x1.02f0b8e5747ebp+4, 0x0p+0, 0x1.74be5660cd7d6p-3},
+    {0x1.732cc7b2b9556p+6, 0x1.3e20f5c5e5c9p+6, 0x1.8ac5c20cb97a4p-6, 0x1.ca33d6c02837ap-2, 0x1.8167a6cd052bep+0, 0x0p+0, 1, false, 0x1.3210fd3a0d1e2p+2, 0x1.2023ba7c02df9p-9, 0x1.599cf912e248ap-4},
+    {0x1.8a4cc5d64ed55p+6, 0x1.be2613ebdc00ap+6, 0x1.2eafb6efed657p-5, 0x1.2924c57ac921cp-3, 0x1.7c83121c0e1c8p+0, 0x1.4f27a8295c9bbp+6, 3, false, 0x1.2a9d327c190a6p+2, 0x1.0735aa4884261p-9, 0x1.1b40358dd2704p-4},
+    {0x1.cda26dbc5fae9p+6, 0x1.9309189505ab2p+6, 0x1.9c499e6c77007p-6, 0x1.0f07fba84a3b4p-2, 0x1.6e2e627c40fa5p+0, 0x0p+0, 0, false, 0x1.8a5802efc679bp+2, 0x0p+0, 0x1.c848c58c5c607p-4},
+    {0x1.c3bd3bbf0525ep+6, 0x1.b4597613bc8ecp+6, 0x1.868ef5fb45439p-6, 0x1.0222ad91eb433p-1, 0x1.4b466a7faac5cp-1, 0x1.03c0025aa2f5cp+7, 2, false, 0x1.580a0b96dd731p+3, 0x1.375f8b7ada878p-8, 0x1.7a5c982599adap-3},
+    {0x1.4cfd014943852p+6, 0x1.7d504662a9cap+6, 0x1.3b468e3a3081fp-5, 0x1.07a06e88f99d1p-1, 0x1.3d3c0eef0fcadp+0, 0x0p+0, 0, false, 0x1.7af482bfa4c7p+4, 0x0p+0, 0x1.d2b112aff7a27p-3},
+    {0x1.7ed6a2fe7bceap+6, 0x1.52a1a4f91f6a2p+6, 0x1.3cc4379fcfc25p-5, 0x1.6010234fbd8b8p-2, 0x1.a9bc7469b6442p+0, 0x1.4569a4251c6fap+6, 3, false, 0x1.16071e6385358p-8, 0x1.e11004623683bp-16, 0x1.dbe9673218496p-11},
+    {0x1.5ed451bcb7803p+6, 0x1.744e9b6117924p+6, 0x1.a2a555b2b798ap-6, 0x1.29137e67ad804p-2, 0x1.9a2e1ddf4de86p-1, 0x0p+0, 1, true, 0x1.bf27aef5a7076p+1, 0x1.0160334547411p-9, 0x1.23d450d55c63ep-4},
+    {0x1.83804190fb1b8p+6, 0x1.5178c7642af33p+6, 0x1.63596efac2debp-5, 0x1.c534f1cc08f52p-3, 0x1.fcc03750bc8b4p-1, 0x0p+0, 0, false, 0x1.1fc1a6e6d7284p+1, 0x0p+0, 0x1.b5032ade5cd68p-5},
+    {0x1.65f9c37f5d25cp+6, 0x1.47ad2a0b29145p+6, 0x1.27f678dbb911fp-5, 0x1.d06f25c7d5c76p-3, 0x1.b9907536f7ccfp-2, 0x1.30477fc5dbf9bp+6, 3, false, 0x1.2e8d663c6f552p-3, 0x1.b23a6f354b811p-13, 0x1.b7e55b653e4d6p-8},
+    {0x1.493d73ae415f3p+6, 0x1.4587b1142efcep+6, 0x1.47489164d499cp-5, 0x1.67b0d05cb7fbp-2, 0x1.5fd45a9cef262p+0, 0x0p+0, 0, false, 0x1.50c6feedcad5cp+3, 0x0p+0, 0x1.18cd047b18771p-3},
+    {0x1.de1e913c1e725p+6, 0x1.051c3e3e1fe16p+7, 0x1.25eb6dfdbbd8p-5, 0x1.3f103fb001334p-3, 0x1.a11e8c99c4667p+0, 0x0p+0, 1, true, 0x1.61f503bdfa682p+1, 0x1.d2f0e0cd80de9p-10, 0x1.01058f52ba3e9p-4},
+    {0x1.66506dce0e8ep+6, 0x1.776c05a889cefp+6, 0x1.810dd3f496ad8p-6, 0x1.9cc4ca416b202p-2, 0x1.97e6c1878a85p+0, 0x0p+0, 1, false, 0x1.7a385087f2d4p+3, 0x1.182b30c2c98e2p-9, 0x1.1171da83d2a8ep-3},
+    {0x1.de8cc8d35cb11p+6, 0x1.b57dd2c02ebd4p+6, 0x1.038575d81aaa4p-5, 0x1.117b8bd639b0ep-1, 0x1.4f62ba93dad4dp-2, 0x1.132a8d132219p+7, 2, false, 0x1.dc1698ba4c34cp+2, 0x1.ceaac7ca063ap-9, 0x1.12b8414ce0333p-3},
+    {0x1.c7abbaca30f05p+6, 0x1.ad3bd11b808e1p+6, 0x1.0668eec7f990bp-5, 0x1.1b5e525d5afc8p-3, 0x1.731566f130b52p+0, 0x1.8351f85f0fff7p+6, 3, true, 0x1.bf4e1011202c6p+3, 0x1.71d4462760073p-9, 0x1.450d8f7fa7e4ap-3},
+    {0x1.d29bc4971c15ep+6, 0x1.bc250350d11fap+6, 0x1.3ed36cb268175p-5, 0x1.44d3461405d16p-2, 0x1.1a6af873a4d3bp-1, 0x1.0c4cc43d49bfcp+7, 2, false, 0x1.975765b68da3cp+2, 0x1.74b19629b98edp-9, 0x1.c33af724c74cbp-4},
+    {0x1.c5821dbeb512ep+6, 0x1.cecee3111e32dp+6, 0x1.954663d2b7617p-6, 0x1.e1ca3cbf88c8ap-2, 0x1.28400de8da3e8p-1, 0x0p+0, 0, false, 0x1.07e25fb889de2p+4, 0x0p+0, 0x1.9020cc40ea797p-3},
+    {0x1.bbee26036e4bfp+6, 0x1.9d4c8356974fep+6, 0x1.a3a3f5f3471dep-6, 0x1.8d39a895af27ap-3, 0x1.449bc9f13eff5p+0, 0x1.795739e950f3cp+6, 3, true, 0x1.cff17e9e4026bp+3, 0x1.1b95b4f23ef69p-8, 0x1.9500fed015d24p-3},
+    {0x1.c959e52ac4a91p+6, 0x1.cc40ab2cca1e6p+6, 0x1.725fd5997edb2p-5, 0x1.2283ef74e9da4p-3, 0x1.b42694f8b8917p+0, 0x0p+0, 1, false, 0x1.8ebac65b60c5bp+1, 0x1.5bed7c9fe980fp-10, 0x1.ac2db3dd18d19p-5},
+    {0x1.59366f8e745e5p+6, 0x1.643e5a9137b79p+6, 0x1.d0288f7c401fdp-6, 0x1.265d0a16388d2p-2, 0x1.c7e12fc2fac86p+0, 0x1.256e4539161cfp+6, 3, false, 0x1.30e20199632a3p-2, 0x1.fe6eca365a0f9p-12, 0x1.ffc8ebb3ba6ffp-7},
+    {0x1.6718ae8bde554p+6, 0x1.4ccb57c8a2ef1p+6, 0x1.80f3e5154392fp-5, 0x1.dd99546f1d785p-3, 0x1.cfa66abc1a54fp-1, 0x1.9cf5fbeda6153p+6, 2, false, 0x1.9f80618500932p+1, 0x1.d76df0198f376p-10, 0x1.0c36482707ed1p-4},
+    {0x1.9fe5e9b0e86f2p+6, 0x1.ba767d90cd585p+6, 0x1.6f1bb150e57dfp-5, 0x1.3b5be390da2e4p-3, 0x1.573f26516d114p+0, 0x1.de4866583e7fcp+6, 2, false, 0x1.b68bcd136d6f9p+2, 0x1.27650c919c463p-9, 0x1.94d84e15c85eep-4},
+    {0x1.605f4c066f054p+6, 0x1.2e4fcd7cfe044p+6, 0x1.69e468dfea72ep-5, 0x1.2e867a433d0fp-1, 0x1.d2892328e95dep-2, 0x1.2b8433d244c47p+6, 3, true, 0x1.de6eea146a6f7p+3, 0x1.0987fb0f679b4p-7, 0x1.2fcbfef6ae22dp-2},
+    {0x1.c1f897bd4f3bep+6, 0x1.fe3a560ba3f8ep+6, 0x1.5452b63c3d8f8p-5, 0x1.31d804e862c39p-1, 0x1.c9381e3113512p+0, 0x0p+0, 0, true, 0x1.075988045775dp+5, 0x0p+0, 0x1.ba317c24c15ccp-1},
+    {0x1.90a2a20e85331p+6, 0x1.70196df9cd883p+6, 0x1.6eb1348afb197p-5, 0x1.25b4948c29c64p-1, 0x1.90b733f76d0d1p+0, 0x1.ccbb072a4c611p+6, 2, false, 0x1.45ee2953b481cp+3, 0x1.681602c74967p-8, 0x1.9c78fcaf30847p-3},
+    {0x1.c4ece8a695324p+6, 0x1.d9a9b4b7b290dp+6, 0x1.935c8301c647dp-6, 0x1.98e994c77c652p-2, 0x1.a061b3a0b5af8p+0, 0x1.046e9f5fc8fcep+7, 2, false, 0x1.bc5d492d03b5ep+3, 0x1.9ae5b49cfed23p-8, 0x1.efb17d59b4b29p-3},
+    {0x1.68895ec7988f7p+6, 0x1.509a6f5bfb0f6p+6, 0x1.5e8ca4859f503p-6, 0x1.04f8296dda25cp-2, 0x1.7e029996c732ep-1, 0x1.9e9df9cbef71bp+6, 2, true, 0x1.3cba12a5a40dbp+0, 0x1.0f89ec02a3c41p-10, 0x1.10f87f21dd005p-5},
+    {0x1.c9e5cc04dd6cp+6, 0x1.f5c58a24bc815p+6, 0x1.926441e06014ap-6, 0x1.21fa3723a71a2p-3, 0x1.9b11c13998947p-1, 0x1.85368704229bdp+6, 3, true, 0x1.56c15d56d50d1p+1, 0x1.dcdac03fb90a4p-10, 0x1.03e50c43c5ea6p-4},
+    {0x1.d77f181a648cp+6, 0x1.9186c51f1afd8p+6, 0x1.58478f3e281c3p-5, 0x1.e6fc7cb050addp-3, 0x1.b913945442218p+0, 0x0p+0, 1, false, 0x1.445c985b9e37bp+0, 0x1.2b050126cb462p-10, 0x1.3931ba3fe1881p-5},
+    {0x1.a67c2aaf68057p+6, 0x1.c1b94d17b3c36p+6, 0x1.70623ed977aa3p-5, 0x1.91fbaa4fc358cp-3, 0x1.8b502626c9db9p-1, 0x1.e5db977cead3p+6, 2, false, 0x1.099e1bc0294c5p+3, 0x1.2087e430dbebdp-9, 0x1.b9608b81d9f3cp-4},
+    {0x1.d856ea846cf98p+6, 0x1.cde1623053715p+6, 0x1.68cf5551ac04p-5, 0x1.c6f1eecee3c6p-2, 0x1.4a1210425db54p-2, 0x1.917d1423c3074p+6, 3, false, 0x1.ca9374c838bb5p-2, 0x1.2f5bb71f4ca66p-11, 0x1.34a16ebac8051p-6},
+    {0x1.8fee2f567caacp+6, 0x1.ca7ea138ec12dp+6, 0x1.7cc9e01dea1b3p-6, 0x1.54b453fd77392p-2, 0x1.30b78b732439bp+0, 0x1.cbeb833d0f5dfp+6, 2, true, 0x1.1c56b1a40f476p-15, 0x1.d3bed0db546afp-21, 0x1.ce443700a3191p-16},
+};
 
-    for (int i = 0; i < count; i++) {
-        double spot = spot_dist(rng);
-        double strike = spot * moneyness_dist(rng);
-        int type = type_dist(rng);
+// generate_options(200, 0x5EED16)
+constexpr RefRow kHeldout[200] = {
+    {0x1.b5e80b6c9d936p+6, 0x1.b1ad51b32f00bp+6, 0x1.d584db0e714ap-6, 0x1.a70eadcebaacap-3, 0x1.0d8757d20b019p-1, 0x1.7438701c52bd4p+6, 3, true, 0x1.f3b246529ba74p+2, 0x1.561577de532dp-9, 0x1.d131d3e50362ep-4},
+    {0x1.d6152e476b102p+6, 0x1.0b64d220240f4p+7, 0x1.d8e6d1f63ec71p-6, 0x1.2b4c54d3042b4p-1, 0x1.a969d7375fe68p+0, 0x1.0e4c2dcf77294p+7, 2, false, 0x1.34367a76784dp+4, 0x1.3026c54db2518p-7, 0x1.6779af9977166p-2},
+    {0x1.4236b822d1ad6p+6, 0x1.6cc3a0883aa7ap+6, 0x1.10e33ab8f0e22p-5, 0x1.e0349ad6d2cbfp-4, 0x1.ace219e6c8df7p-1, 0x1.728bba280aba9p+6, 2, true, 0x1.9a08c0b62d4ffp-8, 0x1.7f53ff35a6762p-16, 0x1.7c3a1a62a5b5p-11},
+    {0x1.adb1ea38ee7b3p+6, 0x1.86e72a8a93e9cp+6, 0x1.51b7b60bf4a29p-6, 0x1.2a8ea00d09afep-3, 0x1.c58fc0042df93p+0, 0x1.6d3da0b0644f2p+6, 3, false, 0x1.5e06482635788p-4, 0x1.61cd6b39bda48p-13, 0x1.6216b1f85cc81p-8},
+    {0x1.ae87b32fad03p+6, 0x1.9fbf2a0d63cbp+6, 0x1.6c3b04f7f6213p-5, 0x1.78c97b23dba5cp-2, 0x1.a35945585a112p-2, 0x0p+0, 0, true, 0x1.9b85d8ee168e7p+3, 0x0p+0, 0x1.80cb42fe0406ep-3},
+    {0x1.af5456d841bb9p+6, 0x1.dd97f41d7d10ap+6, 0x1.f4a39e73096bcp-6, 0x1.116738c8f166fp-2, 0x1.3adfdda6d6e04p+0, 0x0p+0, 1, true, 0x1.f909dc6561474p+1, 0x1.5694dfd60744bp-9, 0x1.7723d3b29d1bep-4},
+    {0x1.71288a89aa3e6p+6, 0x1.868369dbd3c96p+6, 0x1.01d19a3eaff99p-5, 0x1.826f0424c0854p-2, 0x1.e79275e4eb11fp-1, 0x0p+0, 1, true, 0x1.8d3f3e68492d1p+2, 0x1.aecbcd65d41dbp-9, 0x1.efdaffcc8a4a5p-4},
+    {0x1.d5154cafe0bafp+6, 0x1.d3f3c5114cf5ap+6, 0x1.3a798f2713f9bp-5, 0x1.0ab645cfe0b3ap-3, 0x1.efb479b0b7a31p-1, 0x1.8eb8812f189eep+6, 3, true, 0x1.0d2153bf951edp+3, 0x1.2793229308186p-9, 0x1.c0a4aa4d9fc5ep-4},
+    {0x1.d8377354403c8p+6, 0x1.028404607ee1bp+7, 0x1.3e54f73ae4a4ep-5, 0x1.386c04cd28b78p-3, 0x1.0d9e37153a537p-1, 0x1.9162553ad0337p+6, 3, false, 0x1.f351833715551p+2, 0x1.dcebf51a266a1p-10, 0x1.48336b6102317p-4},
+    {0x1.b3e4c9b284824p+6, 0x1.e0f39883b7c96p+6, 0x1.136872ff8b76fp-5, 0x1.24347f49ef314p-1, 0x1.1be171d016fadp+0, 0x0p+0, 0, true, 0x1.74037bd9f6b87p+4, 0x0p+0, 0x1.13478d308dcc2p-1},
+    {0x1.ca8508e6e63a5p+6, 0x1.eaa4c41831d54p+6, 0x1.0c9b9c73abd22p-5, 0x1.e94280065561fp-3, 0x1.0a433cb4a2fe6p+0, 0x0p+0, 0, false, 0x1.abd8e040c6a61p+3, 0x0p+0, 0x1.3e27b17571347p-3},
+    {0x1.b26aa0b76d97p+6, 0x1.867ada378f10bp+6, 0x1.43e440aaa0ac2p-5, 0x1.5994af8858978p-3, 0x1.e7184b94e781dp-1, 0x0p+0, 1, true, 0x1.a00d3df97b00bp+3, 0x1.c1630f6183d87p-11, 0x1.89da3edf9a0fcp-4},
+    {0x1.45f8922f40be5p+6, 0x1.16a7670253ff2p+6, 0x1.48a2c1223f8c6p-5, 0x1.1a8ea01834595p-3, 0x1.43f1482182e72p-1, 0x1.76dddb4ff0dadp+6, 2, false, 0x1.502da52e9759ep-3, 0x1.2a942a186a3d3p-12, 0x1.2bebf71e6431p-7},
+    {0x1.8f3b0178eea53p+6, 0x1.6bef93d628a38p+6, 0x1.78464fe2bc442p-6, 0x1.0e492f208f579p-1, 0x1.4cead5b6119aap-2, 0x1.53588e0d313fap+6, 3, true, 0x1.b914ef96c4829p+3, 0x1.9559705bd936dp-8, 0x1.e9fc43a9fde31p-3},
+    {0x1.864af26c2cd45p+6, 0x1.a56d5ec94fdd8p+6, 0x1.6ad73f1a4bfbfp-6, 0x1.856172804977ap-2, 0x1.4429f96ac1568p+0, 0x0p+0, 1, true, 0x1.c75cfd350b276p+2, 0x1.0e1f2a239b17fp-8, 0x1.301ea9c56a38p-3},
+    {0x1.c3f839372028ap+6, 0x1.bf6bafad48091p+6, 0x1.8879a59383e11p-6, 0x1.f14798c4cbcbcp-2, 0x1.9e77d7e6830acp-1, 0x1.802c970874ef5p+6, 3, true, 0x1.ea3b6e7541ac4p+3, 0x1.5891fdc93bfdfp-7, 0x1.76e847ab282b6p-2},
+    {0x1.9c55991230812p+6, 0x1.8d16261fb9663p+6, 0x1.14c28320a445ep-5, 0x1.3d2295830eaap-2, 0x1.7e4031c183002p-1, 0x1.5e7bf54f76076p+6, 3, true, 0x1.8e646bff2c6b5p+3, 0x1.5b47f1fb13938p-8, 0x1.ab7fd7bf03a5dp-3},
+    {0x1.9396871fe9beap+6, 0x1.cf0b1cdb1af2p+6, 0x1.977937181483dp-6, 0x1.cd82cb40a33ap-4, 0x1.3e52460b9c144p+0, 0x1.d0204e97e668p+6, 2, false, 0x1.836d47932a8e4p+3, 0x1.43ea0b94cf7a9p-10, 0x1.b7c821e8eb0c3p-4},
+    {0x1.4670f6c3220ecp+6, 0x1.44b4de54b1a15p+6, 0x1.94a20424189e6p-5, 0x1.f8ceaa944f1e2p-2, 0x1.c697f4829b476p+0, 0x0p+0, 0, true, 0x1.7e534d22aff79p+4, 0x0p+0, 0x1.fa6a8672249cap-2},
+    {0x1.bfc17322a0af1p+6, 0x1.cdcbb183eb83ap+6, 0x1.5612a9c88ca8bp-5, 0x1.b525d0b2ebb3cp-2, 0x1.b97850fa5aeecp+0, 0x0p+0, 1, true, 0x1.cad3bb476dcb6p+3, 0x1.d146163a8692cp-8, 0x1.10c7a526b229p-2},
+    {0x1.90de990c37863p+6, 0x1.c1cb0d1ecd2d3p+6, 0x1.087b1a3fdda96p-5, 0x1.b70d54f0a9244p-2, 0x1.a72dcdf57fe24p+0, 0x0p+0, 0, false, 0x1.9c9d45d4358ccp+4, 0x0p+0, 0x1.08664da0f8cbcp-2},
+    {0x1.c4b65d6f6af4p+6, 0x1.bf6f01c033d07p+6, 0x1.27f7678d962e6p-5, 0x1.0514a7d3d893cp-2, 0x1.6a724043a1bbap-2, 0x0p+0, 0, true, 0x1.06f8e28acd96ap+3, 0x0p+0, 0x1.e5dd92bd675acp-4},
+    {0x1.43aed4167d0b7p+6, 0x1.667f108bc02d5p+6, 0x1.84a7ea19d3236p-5, 0x1.2b82a53d5e2f6p-1, 0x1.2b6209284bcdbp-2, 0x1.743c40b376338p+6, 2, false, 0x1.5e928c6162a92p+3, 0x1.c416830bd6196p-9, 0x1.3b2922cd49e77p-3},
+    {0x1.d86e9901c9683p+6, 0x1.a2401fca1f42ep+6, 0x1.749c00cfee622p-6, 0x1.190498b76d54cp-1, 0x1.15abd17d3d799p+0, 0x0p+0, 0, true, 0x1.0cbe591d62437p+5, 0x0p+0, 0x1.386272d53bcb8p-1},
+    {0x1.8f616c8b14261p+6, 0x1.6ad80f2de21edp+6, 0x1.6e51fda9a0356p-5, 0x1.1fb036d272124p-1, 0x1.7788ce8112c16p+0, 0x1.537935dc9ded2p+6, 3, false, 0x1.8b2bb2f610791p-8, 0x1.7ceeeb132a471p-15, 0x1.78c643367eaf4p-10},
+    {0x1.51f718ff18c24p+6, 0x1.513b796db9001p+6, 0x1.1eb24da3d493fp-5, 0x1.4dd64ac149976p-2, 0x1.bf9da9dcdbc33p-1, 0x0p+0, 1, false, 0x1.48ac5a252ea17p+2, 0x1.9b0927b5cf08ap-10, 0x1.2464e4044cdf5p-4},
+    {0x1.7d6f7b74740cbp+6, 0x1.b04c9eff9a4efp+6, 0x1.aec945a01afe1p-6, 0x1.1dd36d2696679p-1, 0x1.d8a71680eb3edp-1, 0x0p+0, 0, true, 0x1.089638ab3f37ep+4, 0x0p+0, 0x1.8c18b6323a861p-2},
+    {0x1.7fa9b048a5415p+6, 0x1.b8e70d838165ep+6, 0x1.216f49cddb8f5p-5, 0x1.2f1d406fa151p-3, 0x1.f1d9e25647f0ap-1, 0x1.b9365786be0b1p+6, 2, true, 0x1.ecd9c72d3ccf8p-18, 0x1.9a4361ab6da7ap-23, 0x1.9574f686e58adp-18},
+    {0x1.ad260bf8627cp+6, 0x1.c96d2acd62755p+6, 0x1.0dab22fd387b4p-5, 0x1.e712b50e6a4c1p-3, 0x1.3446018bc72c9p-1, 0x1.ed855a90d7a83p+6, 2, true, 0x1.4ba1eb80c5f6cp-3, 0x1.1d39cea6730bp-12, 0x1.1ed07f50bfe06p-7},
+    {0x1.acae5c28c30fep+6, 0x1.eb44383b2bd66p+6, 0x1.44f47bfd85bcep-5, 0x1.82928c3646e09p-3, 0x1.e9453f40a692ep+0, 0x0p+0, 1, true, 0x1.56cb468f2f9b1p+1, 0x1.087e6353764cdp-9, 0x1.1b75ff6b450cfp-4},
+    {0x1.575ad6d24c717p+6, 0x1.536c1e5e3a246p+6, 0x1.07fb2c38bea72p-5, 0x1.ae95c2f53f4aap-2, 0x1.9cfc60e0814bap-1, 0x1.8adbaa3ea4b5ap+6, 2, false, 0x1.026a3beac3dd9p+3, 0x1.c8f3c35d3c646p-9, 0x1.17de477d70e83p-3},
+    {0x1.bc5e8f66c518dp+6, 0x1.ec5ceacf0813cp+6, 0x1.2695d491531p-5, 0x1.10f2577cbf85ep-1, 0x1.2861e6dc07c89p+0, 0x0p+0, 1, false, 0x1.43b6c64df2a73p+4, 0x1.3f69ce15638adp-9, 0x1.9d3c02e332b5p-3},
+    {0x1.b799fd7df97e4p+6, 0x1.e41f1ce774f69p+6, 0x1.0651997b0200ap-5, 0x1.328e90a04214bp-1, 0x1.ea2698aefd8fdp-1, 0x0p+0, 0, true, 0x1.69b211e73e10dp+4, 0x0p+0, 0x1.0a5b0db410316p-1},
+    {0x1.40916ea163c6bp+6, 0x1.6edc7c780c855p+6, 0x1.e65675b6b3cbap-6, 0x1.c131fae4e195ep-2, 0x1.ccac25e7815ebp+0, 0x1.70a73f3999247p+6, 2, true, 0x1.c85e31fd43a1ep-16, 0x1.d38f2de5b2a6ap-21, 0x1.ce11f453bcfe3p-16},
+    {0x1.7b51f01fb9192p+6, 0x1.82be7b9669667p+6, 0x1.1e698b393b9c6p-5, 0x1.e2fe4a358fe34p-3, 0x1.97b63a43bb979p-1, 0x1.426c0c1af6eefp+6, 3, true, 0x1.fdbff8e0d8615p+2, 0x1.c18c8a264e0c2p-9, 0x1.1395f8db1aa9ap-3},
+    {0x1.620a87da4d819p+6, 0x1.467e440465ae3p+6, 0x1.7b799c4a87ca7p-5, 0x1.1b8e1848b801dp-3, 0x1.d72c5257e9b6fp+0, 0x0p+0, 1, false, 0x1.195eda8a7f271p-1, 0x1.1d84487886a4dp-11, 0x1.282b4922e290ap-6},
+    {0x1.dbf88d83cebb4p+6, 0x1.d11d14db001e8p+6, 0x1.d5be0502d9c12p-6, 0x1.2c450110cea8ep-1, 0x1.1608a80b8e7bdp-1, 0x0p+0, 0, false, 0x1.1cb63afcaa073p+4, 0x0p+0, 0x1.bea276a8e898ep-3},
+    {0x1.5edf370f0d15dp+6, 0x1.4e40844c00e89p+6, 0x1.1c3153db60a82p-5, 0x1.6b333b525e927p-3, 0x1.25a77a90d15p+0, 0x0p+0, 1, false, 0x1.7d21b9158a083p+0, 0x1.cfd22ca09657fp-11, 0x1.039bd8ffb8523p-5},
+    {0x1.917f8f3916a22p+6, 0x1.5bfe4b2cff5efp+6, 0x1.e090aab4cca1ep-6, 0x1.83777629f204p-2, 0x1.19a65132eb817p+0, 0x1.5546068a2009dp+6, 3, true, 0x1.147271cd93fe3p+4, 0x1.2ca437b9a4e7ap-7, 0x1.59c8c26a9a648p-2},
+    {0x1.bd983ff0cfc57p+6, 0x1.d6ad38f6fff53p+6, 0x1.95fb9ff8f4165p-5, 0x1.2945884f34f51p-1, 0x1.e6eaebe28f33ep+0, 0x1.7ac1698cb09bp+6, 3, false, 0x1.64099aa1a79d8p-4, 0x1.5582ce8ed8ea1p-12, 0x1.52af5a5bf8523p-7},
+    {0x1.5f6069d3a396bp+6, 0x1.72a06c0a2c6d9p+6, 0x1.7f33c8b1eeeb4p-6, 0x1.fcfc0339da321p-3, 0x1.85cbd5b792f46p+0, 0x0p+0, 0, false, 0x1.73563005cf4bp+3, 0x0p+0, 0x1.19785ee41b9f8p-3},
+    {0x1.da2bb0899c8a5p+6, 0x1.03c5e3608f965p+7, 0x1.64677f3390185p-5, 0x1.675da0739c05p-2, 0x1.97385259b3d5ap-2, 0x0p+0, 0, true, 0x1.b8d19ca5b9e42p+2, 0x0p+0, 0x1.297b299677251p-3},
+    {0x1.52684ff2c135bp+6, 0x1.79fc0cb177c88p+6, 0x1.58eff7170ba0ep-5, 0x1.2a342e5542a68p-3, 0x1.de14029bd81ffp+0, 0x1.1fa57727f1074p+6, 3, true, 0x1.5b974fcff8a73p+2, 0x1.63529228f1bbfp-9, 0x1.9fabe106d6ce9p-4},
+    {0x1.8f3e01e94accap+6, 0x1.5a82311aaa47ep+6, 0x1.6e64a73a46909p-5, 0x1.7dac2b2c78dd8p-2, 0x1.40793452313f3p+0, 0x0p+0, 0, false, 0x1.eba20ca9995e5p+2, 0x0p+0, 0x1.00478ca1b6365p-3},
+    {0x1.6aa18e0c53fbcp+6, 0x1.34a0938a5c63dp+6, 0x1.4f9c727c6e897p-5, 0x1.e6ab3cf536d4ep-4, 0x1.100244799e055p-2, 0x0p+0, 0, true, 0x1.cadfa2914d208p+3, 0x0p+0, 0x1.c6723f85a77fcp-5},
+    {0x1.d93aa9d467c1dp+6, 0x1.0787d5116e7d8p+7, 0x1.fccbc1324f6a2p-6, 0x1.19638e4f01d8ap-1, 0x1.39706c3ef27b5p+0, 0x1.923ea9f48b64cp+6, 3, false, 0x1.634172b7fa3ebp-2, 0x1.8ff839c111e4dp-11, 0x1.8f522513d0967p-6},
+    {0x1.41f36bace256dp+6, 0x1.55cffec9caae6p+6, 0x1.974b00d4b5811p-5, 0x1.b065893774eb8p-2, 0x1.c95c333b6612fp+0, 0x0p+0, 1, false, 0x1.595baae361251p+3, 0x1.0835af62235fcp-9, 0x1.f9843c7367b93p-4},
+    {0x1.c5df62df9aee4p+6, 0x1.cf701c4f14fefp+6, 0x1.26a9f7474a0c8p-5, 0x1.4f448f5a43625p-2, 0x1.42a6953ee771p+0, 0x0p+0, 1, false, 0x1.2b6b66d0efab1p+3, 0x1.353a74bd99ed8p-9, 0x1.e944216b5f981p-4},
+    {0x1.96714cec4e8abp+6, 0x1.7a0e88d9f8e57p+6, 0x1.127fd2d0606ffp-5, 0x1.09c7ef289d6e2p-3, 0x1.871531eb20c3bp-2, 0x1.d368b20fc0b91p+6, 2, false, 0x1.27635b287c232p-1, 0x1.1e9feaed71c88p-11, 0x1.2a9a1176d338ap-6},
+    {0x1.5d01e0e46c079p+6, 0x1.89cff78ec658fp+6, 0x1.ed06bc5d49409p-6, 0x1.fc7e2aec9c4cp-3, 0x1.b86cb99cf524p+0, 0x0p+0, 0, false, 0x1.e2162d4f43af3p+3, 0x0p+0, 0x1.4602594b4beeep-3},
+    {0x1.58e0567c3e86dp+6, 0x1.2909bdced4da2p+6, 0x1.e48502ccc55a8p-6, 0x1.dc35cef061ce6p-2, 0x1.af512d42a1632p-2, 0x0p+0, 1, false, 0x1.607a810a50a6cp+0, 0x1.0bbf87fc333dep-10, 0x1.1fa157e3e45fbp-5},
+    {0x1.bb648b7bee775p+6, 0x1.f25001a3fcc0dp+6, 0x1.5b049f8c145dp-5, 0x1.b312ff5ba70ecp-3, 0x1.e0821282faa0ap+0, 0x0p+0, 1, false, 0x1.91e687b65497bp+3, 0x1.876456393fecap-10, 0x1.f5b7751660de7p-4},
+    {0x1.8669dfc49276bp+6, 0x1.6c2f823272616p+6, 0x1.9782e0ec843c4p-5, 0x1.d6a0481f499aep-2, 0x1.739324711afdap+0, 0x0p+0, 1, true, 0x1.0c18c2a5569bcp+4, 0x1.90cfca549ac29p-8, 0x1.05c1e23298067p-2},
+    {0x1.a093424e52306p+6, 0x1.ad39ac7c2c08fp+6, 0x1.f90dbf94c1d1ep-6, 0x1.4f1f2cda8788dp-2, 0x1.9685ec9374897p-2, 0x0p+0, 0, false, 0x1.32d551363db5dp+3, 0x0p+0, 0x1.e278b2b83f0a8p-4},
+    {0x1.bd5f5563d5f6ep+6, 0x1.8323b3d7cdcb7p+6, 0x1.3d0377293d73bp-5, 0x1.2d992772ef072p-1, 0x1.44f57449913fap+0, 0x1.7a910894dc451p+6, 3, true, 0x1.4e61c84f8d4fap+4, 0x1.34321c8450117p-6, 0x1.42cffe538b798p-1},
+    {0x1.99fd5284f42d7p+6, 0x1.7ae45ebfafdaap+6, 0x1.936bdb0725e38p-5, 0x1.b7b662b0f95fcp-4, 0x1.c9f23e2a20d84p-2, 0x0p+0, 0, true, 0x1.42e9749a6dd5ap+3, 0x0p+0, 0x1.1ba8000c306cap-4},
+    {0x1.ae453b5a332b6p+6, 0x1.eceaac229c4bdp+6, 0x1.89615b261961dp-5, 0x1.7492d6572ca8cp-2, 0x1.bd81f54239cd7p-1, 0x1.6dbad8d9784b4p+6, 3, false, 0x1.abbe3df8175f8p+0, 0x1.a6ee005f9c2f1p-10, 0x1.a4d02f8317331p-5},
+    {0x1.5f4334f121b64p+6, 0x1.2cc982fd910ap+6, 0x1.baf04eeb08637p-6, 0x1.2e28f99c60c2ap-1, 0x1.ddd149749dfb9p-1, 0x1.2a92b9ccf6415p+6, 3, true, 0x1.f5ffae69c075p+3, 0x1.91b40a2598ba5p-7, 0x1.ac3d2c1f1a1cp-2},
+    {0x1.ca7320e6f78b4p+6, 0x1.e08e1184c86dbp+6, 0x1.db8d98d7f268p-6, 0x1.18cc8e6589e0cp-2, 0x1.9659441916695p-1, 0x1.85aea8c452699p+6, 3, true, 0x1.290d5e06e6f6ep+3, 0x1.3ced292741985p-8, 0x1.6e603ed3c40cep-3},
+    {0x1.4297480b7b44fp+6, 0x1.3eafa255d8dc3p+6, 0x1.e9bc5ae842aacp-6, 0x1.11401175c53e8p-3, 0x1.f77c54eaed9dbp+0, 0x1.1233ca09c261p+6, 3, false, 0x1.1c0a17c0cd8bdp-1, 0x1.0962997e67ad7p-11, 0x1.158f98247e4a8p-6},
+    {0x1.dd6c5fdd339b4p+6, 0x1.d5646df3e7c6bp+6, 0x1.eb615490ed11cp-6, 0x1.fa1001089a8eap-2, 0x1.6492bbe255559p+0, 0x0p+0, 1, false, 0x1.aab2f351aea7fp+3, 0x1.b01d99d83af58p-9, 0x1.5a34021bf704bp-3},
+    {0x1.88a0fa8fecc0ep+6, 0x1.649104deb52e4p+6, 0x1.86635edd1e1dap-6, 0x1.f96b66338ceaap-2, 0x1.df611ea6d9ff9p-2, 0x0p+0, 1, false, 0x1.b7039baae1a1cp+1, 0x1.c048dc9b7f5bcp-10, 0x1.064b47eba5ac1p-4},
+    {0x1.83d799fa6205p+6, 0x1.5aefe56e076d1p+6, 0x1.5d5e17d7c50f4p-5, 0x1.d5e54c22891aep-2, 0x1.45af360606b44p+0, 0x1.be04bddff0b8fp+6, 2, true, 0x1.1c43705028223p-2, 0x1.2e31ee0eb82e2p-11, 0x1.2e0cd55f8663bp-6},
+    {0x1.68216ea55fa48p+6, 0x1.3c3db452dab62p+6, 0x1.e116e7b25822fp-6, 0x1.6c6cdf8d835c2p-2, 0x1.05359989f1dc3p+0, 0x0p+0, 1, true, 0x1.ccbe39c24954p+3, 0x1.79424c7404697p-9, 0x1.4b6ddc4dedb6bp-3},
+    {0x1.8d8aa7e690fddp+6, 0x1.8d12af7887a1dp+6, 0x1.4dee06907754fp-5, 0x1.13dc8a830932cp-1, 0x1.25ee19da710b4p+0, 0x0p+0, 0, false, 0x1.3cb2ccc5597c3p+4, 0x0p+0, 0x1.caccccc59112fp-3},
+    {0x1.6769fd119f4bep+6, 0x1.63b70492b3974p+6, 0x1.7d2fa7c5e4e84p-5, 0x1.37413d4c770b1p-2, 0x1.12f4aecad42e6p+0, 0x1.9d537ca110ca7p+6, 2, false, 0x1.ab0f4eccad8b4p+2, 0x1.87dd0ed7537dcp-9, 0x1.d9fbeb9afa619p-4},
+    {0x1.95c94933cd211p+6, 0x1.7d0fc897c983fp+6, 0x1.920c52f186f97p-6, 0x1.3a5d5c032d6bp-2, 0x1.5e9ffe41e6da4p+0, 0x0p+0, 1, true, 0x1.8b63f1e02a386p+3, 0x1.d319dd1996809p-9, 0x1.543eed6dc2d8dp-3},
+    {0x1.7d71ff88da9bfp+6, 0x1.6fdd64930b8afp+6, 0x1.fc8d20341fcbep-6, 0x1.333475383d7f3p-2, 0x1.b57e0ceda3e1ep+0, 0x0p+0, 0, false, 0x1.4f5cdec95404dp+3, 0x0p+0, 0x1.2818177f0080cp-3},
+    {0x1.5e95064e411c7p+6, 0x1.8898558661b3p+6, 0x1.5f664d6ae0e58p-6, 0x1.7e07850bb139ep-3, 0x1.b0183393bd071p+0, 0x0p+0, 0, true, 0x1.6e33306eea2d2p+2, 0x0p+0, 0x1.ee6a3d25478a8p-4},
+    {0x1.db88e399a612cp+6, 0x1.a5161b3233cb1p+6, 0x1.5ebd99c8087p-5, 0x1.a683f12ac84c2p-3, 0x1.8a07327952ae3p-2, 0x0p+0, 0, true, 0x1.058b3aca1fc4ep+4, 0x0p+0, 0x1.1a5b2307a2989p-3},
+    {0x1.71a1b0ca9d999p+6, 0x1.61e27b083f1a1p+6, 0x1.030b2eaa1236fp-5, 0x1.2eb18eb0b114dp-3, 0x1.329fc3ed00508p-1, 0x1.3a2fd645d2c28p+6, 3, false, 0x1.6c8b1fe7297e4p-1, 0x1.10e613c2c84p-11, 0x1.25d49d4f9797fp-6},
+    {0x1.68a09f3da6f01p+6, 0x1.79130b42a2d9cp+6, 0x1.4e14f0416f87bp-5, 0x1.f27f072c8a742p-4, 0x1.813e7e54e7be5p-1, 0x0p+0, 0, true, 0x1.9c99dcbc475eap+1, 0x0p+0, 0x1.c19ac47240b37p-5},
+    {0x1.4bc86605baa4p+6, 0x1.768029888953ep+6, 0x1.861aefe55ab81p-5, 0x1.28206639a68c3p-1, 0x1.d9eadd4bf9d1fp+0, 0x0p+0, 0, false, 0x1.b38458e004dacp+4, 0x0p+0, 0x1.03c050cad7c09p-2},
+    {0x1.6fe75f8086057p+6, 0x1.8513ca8e6bf23p+6, 0x1.8fdb6816120bbp-5, 0x1.590e377a70fd6p-3, 0x1.bc646fad72f72p-1, 0x0p+0, 1, false, 0x1.4b717d985740ep+2, 0x1.bddedae44f817p-11, 0x1.c903125abd807p-5},
+    {0x1.9aaba74608a49p+6, 0x1.a61530d781ce2p+6, 0x1.677bee9a0c599p-6, 0x1.cc0a2e5dfe86ep-3, 0x1.b526a78d552c9p+0, 0x1.d84566c3bd23ap+6, 2, false, 0x1.2285502059deap+3, 0x1.cc62065f557d2p-9, 0x1.25c3de7780b2cp-3},
+    {0x1.ab88a3837a4f2p+6, 0x1.707f3ec29bab7p+6, 0x1.4907b39050dcdp-5, 0x1.c21da7fc418e7p-4, 0x1.e68a1a84156p-2, 0x0p+0, 0, false, 0x1.1e7a553c3f503p-5, 0x0p+0, 0x1.f6f939e3a8525p-9},
+    {0x1.9b88ee6cb955p+6, 0x1.718ccb7da4a05p+6, 0x1.8a7f88393ef81p-5, 0x1.6fb3344f2754ep-2, 0x1.e062d4b4e3a55p+0, 0x0p+0, 1, true, 0x1.2ccf1e310807cp+4, 0x1.56edfb3e2769dp-8, 0x1.f9d642afeb581p-3},
+    {0x1.75573e0e33169p+6, 0x1.5022ae1949b83p+6, 0x1.8c9a1a96fb4f2p-5, 0x1.120657705147p-1, 0x1.7399612d48e9ep+0, 0x0p+0, 1, false, 0x1.d809ba0740237p+2, 0x1.5630d3f3ba9c7p-9, 0x1.c5734282c8951p-4},
+    {0x1.4e4efba9ec0f4p+6, 0x1.68cf64cc9457ep+6, 0x1.53d44962d4f32p-5, 0x1.0b76b487f462p-1, 0x1.3651b0ee2f72ap+0, 0x1.1c29891d3bd9cp+6, 3, true, 0x1.7e93a842c51p+3, 0x1.5e03c730f4d59p-7, 0x1.6eea4b27546e1p-2},
+    {0x1.98352831fd507p+6, 0x1.928efe9c5bfe7p+6, 0x1.655e19c7628c8p-5, 0x1.b7428076ae5c7p-4, 0x1.5f7fca816b434p+0, 0x1.5af9fbc417513p+6, 3, false, 0x1.f162641a84323p-1, 0x1.6a2e58864d4d3p-11, 0x1.87b4b89cf51cap-6},
+    {0x1.a4d517fa8206p+6, 0x1.c0ea2ef4b1efep+6, 0x1.51006aa8ac1f8p-5, 0x1.ef1deb1d97d9fp-3, 0x1.d898d7bf49f6fp-2, 0x1.e3f50ec67bed4p+6, 2, true, 0x1.90e1bcd1c68b3p-3, 0x1.31b2c0c3dad71p-12, 0x1.34d42cdcf5e14p-7},
+    {0x1.bc05601d4316fp+6, 0x1.9b461d689aeefp+6, 0x1.60ea1953da218p-5, 0x1.5fd2c24aa6a38p-2, 0x1.1b50aea7cf86dp+0, 0x0p+0, 1, false, 0x1.1833300dce39bp+2, 0x1.0de3e6fbc0d23p-9, 0x1.41640cc458b1ap-4},
+    {0x1.81414b718ba5p+6, 0x1.75f76eca2d399p+6, 0x1.da2fb528bc2c9p-6, 0x1.b8be55fd3812cp-2, 0x1.263834aab4825p+0, 0x1.bb0b16c293ca8p+6, 2, true, 0x1.1a6c6f14f6c8ap-3, 0x1.6f42ff131b21fp-12, 0x1.6dbc107ef58e9p-7},
+    {0x1.bede8e36d7baep+6, 0x1.d085960793ebp+6, 0x1.70061b5cac937p-6, 0x1.28246a6a73badp-3, 0x1.fcdaa398cf21p+0, 0x1.00f32b5f88d84p+7, 2, true, 0x1.2b5e848f347e3p-2, 0x1.b382bb0afee46p-12, 0x1.b8e8e836e3508p-7},
+    {0x1.74a2d68d1207ap+6, 0x1.a913100b697cdp+6, 0x1.9f196cd6c6096p-6, 0x1.7e024f9f82c9ep-2, 0x1.a8bbf47c9c79dp+0, 0x1.ac8810556e559p+6, 2, true, 0x1.141439cf54835p-13, 0x1.6533327f937eep-19, 0x1.61084c67686e7p-14},
+    {0x1.d4450fe3d4315p+6, 0x1.f25ed17abd344p+6, 0x1.0a04741449d56p-5, 0x1.29e32c086f4b6p-2, 0x1.beffb8530e4dep-1, 0x0p+0, 0, false, 0x1.dfd6e8418ea42p+3, 0x0p+0, 0x1.62434f6b90387p-3},
+    {0x1.aab23ac9ed1cdp+6, 0x1.9e8d0e8d93169p+6, 0x1.68c93d7816aecp-5, 0x1.0049ba98b441cp-1, 0x1.b11bbc6281f02p-2, 0x1.eab35d3503e11p+6, 2, false, 0x1.19739224921c2p+3, 0x1.e7c929a0e8751p-9, 0x1.2ce454e88ccc1p-3},
+    {0x1.b3bcae14d7e86p+6, 0x1.ec0af1420149bp+6, 0x1.78940826492ccp-5, 0x1.2e87ea837fd7ep-2, 0x1.6df7902a641b9p+0, 0x0p+0, 0, true, 0x1.98e0c58c16425p+3, 0x0p+0, 0x1.08c4a93f908d6p-2},
+    {0x1.5ddbeba7dc011p+6, 0x1.8fc812ffd6faap+6, 0x1.e8b8a7af3efcdp-6, 0x1.6b1fc31b4d85ap-3, 0x1.f92a9c2368ddep+0, 0x1.925682343d013p+6, 2, true, 0x1.0f30a232425fep-12, 0x1.ac81dcc21ad3p-19, 0x1.a7984811d909cp-14},
+    {0x1.d155e13549a12p+6, 0x1.e4e2a47820b9cp+6, 0x1.5afe60665e4e9p-5, 0x1.3874d5f1f1d4dp-2, 0x1.2f2e111a9069fp+0, 0x1.0b91617ea3efdp+7, 2, false, 0x1.5f50467c7ee91p+3, 0x1.2605d151d06c3p-8, 0x1.6f5c2b869ca34p-3},
+    {0x1.9c24c16ce6f64p+6, 0x1.8958d799c90ccp+6, 0x1.76f65ca48e3c9p-5, 0x1.b066189ff2f5ep-2, 0x1.2286eab775ec4p-2, 0x1.5e5271362ab7bp+6, 3, true, 0x1.6a0f8908a124dp+3, 0x1.13c72dbd8ce45p-8, 0x1.6583fa7538cf7p-3},
+    {0x1.812075d30ffd4p+6, 0x1.92eb4aa61fc2fp+6, 0x1.e304227cd65fbp-6, 0x1.f7d56ebedf06ap-2, 0x1.1292247cd4bdbp-1, 0x0p+0, 0, true, 0x1.92a19461f5199p+3, 0x0p+0, 0x1.f185336a9313bp-3},
+    {0x1.b1e340d1c95e2p+6, 0x1.c8e2d9b1db3aep+6, 0x1.0d75dec444ffcp-5, 0x1.feca8491ebaffp-3, 0x1.85caa030e020dp+0, 0x1.f2f88a8adac5dp+6, 2, true, 0x1.3fb2f3a47a7e4p-4, 0x1.b3308133d8444p-13, 0x1.b11738b1f0af4p-8},
+    {0x1.63b5a13eb974ap+6, 0x1.79eedb0dd4548p+6, 0x1.e8457b09ca76ep-6, 0x1.88499686e650ap-3, 0x1.1404cdac0fcfcp+0, 0x1.9910dfd4eedfbp+6, 2, true, 0x1.0a28a05010088p-3, 0x1.d9b77a8be3284p-13, 0x1.dbd135f01c5f2p-8},
+    {0x1.9b8f21d5db521p+6, 0x1.b427afd04d28fp+6, 0x1.1e39242707453p-5, 0x1.e39c445e21e6ap-2, 0x1.bc3490e3f5c3cp+0, 0x0p+0, 1, false, 0x1.00bd27d9b792p+4, 0x1.591d7a7118612p-9, 0x1.688e2d910159cp-3},
+    {0x1.b556ac46ee25cp+6, 0x1.e1397f7a2efe5p+6, 0x1.676375ee98dcp-5, 0x1.08ad085db27ap-2, 0x1.8c3a99fbef11p-1, 0x1.73bcdf3c4a6cep+6, 3, true, 0x1.b4bfc042bc91bp+2, 0x1.03fd37c7ce847p-8, 0x1.247a25cd2302ep-3},
+    {0x1.7eb74af461188p+6, 0x1.64026fbdba729p+6, 0x1.5b12e262b0e65p-5, 0x1.aa5a4f468b254p-3, 0x1.7ef010c149cc6p-2, 0x0p+0, 1, true, 0x1.f30fc1f4ca22bp+2, 0x1.545e887483285p-11, 0x1.03dd392be26bp-4},
+    {0x1.a1e14322930dep+6, 0x1.cb1041f4c1a47p+6, 0x1.17627a40c386ep-5, 0x1.5836f2e26e385p-2, 0x1.cf4bba630b956p+0, 0x1.e08fda015c4ffp+6, 2, false, 0x1.999046d464c4p+3, 0x1.6e31b4eb1c674p-8, 0x1.bec98a009445dp-3},
+    {0x1.c19a83e8ae07fp+6, 0x1.b85fed26d35ddp+6, 0x1.a3de162fad3e2p-6, 0x1.f7e3dcd229d91p-3, 0x1.8fe4ca8e63024p-2, 0x0p+0, 1, false, 0x1.55ea757de72aep+1, 0x1.2b88341d94e82p-10, 0x1.701af67f4dda3p-5},
+    {0x1.aa7b965256858p+6, 0x1.73e7c842c9c9dp+6, 0x1.514336f10b21fp-6, 0x1.b73f3e29b9b26p-2, 0x1.4bd6215b13468p+0, 0x0p+0, 1, true, 0x1.3c5ed7eec87d2p+4, 0x1.67aee27d99f83p-8, 0x1.09ac9a6e39772p-2},
+    {0x1.b72eed3e434dep+6, 0x1.c645d68a7dcb5p+6, 0x1.5386b5f143cb3p-6, 0x1.96256c4604e05p-3, 0x1.2e77078f8d47p+0, 0x0p+0, 0, false, 0x1.3fa88046dc6d4p+3, 0x0p+0, 0x1.0151c20d0d53cp-3},
+    {0x1.8abfe2cf93962p+6, 0x1.970dac0b60b08p+6, 0x1.76ac5a238b786p-5, 0x1.213c312c8224ap-2, 0x1.a4b5ccf7c2159p-1, 0x1.c5f644d51cecap+6, 2, true, 0x1.7d3eb9ed8cbedp-3, 0x1.5a2c1edd4f0f2p-12, 0x1.5b7ccc336287ap-7},
+    {0x1.55308ed95e011p+6, 0x1.58d7a227af54ap+6, 0x1.43eee8dd7afe4p-5, 0x1.120f86b1994cdp-1, 0x1.01aacee1d1e3bp+0, 0x0p+0, 1, false, 0x1.3e8c088e69762p+3, 0x1.22554d1d63cbbp-9, 0x1.f02a42148e22dp-4},
+    {0x1.cfde75cff2a5fp+6, 0x1.9481a56c48c5fp+6, 0x1.59c33901018dep-6, 0x1.21d3fbded7512p-1, 0x1.954befb0f294p-1, 0x1.0ab983bdf8529p+7, 2, true, 0x1.d9245a973d95ap-2, 0x1.bff2c4e816ec3p-11, 0x1.c10c269e78056p-6},
+    {0x1.a4b92d952ac3dp+6, 0x1.9009f48b803dap+6, 0x1.37cf4ef5043c1p-5, 0x1.1c2bff6f1f33dp-2, 0x1.762d08f3901cp+0, 0x0p+0, 1, false, 0x1.184156783cb64p+2, 0x1.f6622d1178237p-10, 0x1.3240401f1c87ap-4},
+    {0x1.c39f1352cf39ap+6, 0x1.9241f60a2bf41p+6, 0x1.e9597490433a3p-6, 0x1.f6c02cc1ae0ecp-3, 0x1.b5eb531be852fp-1, 0x0p+0, 0, true, 0x1.2bf78526f6ca1p+4, 0x0p+0, 0x1.bb81fa359b24fp-3},
+    {0x1.84aa402acea4bp+6, 0x1.95e6f597ec0a6p+6, 0x1.54ca6e7d66f41p-6, 0x1.aae0f095e4ab8p-2, 0x1.c0a20e397886dp+0, 0x1.bef6fcfe073d6p+6, 2, false, 0x1.8d996390a526ap+3, 0x1.76087c909b1dbp-8, 0x1.c0b3e55a0df3cp-3},
+    {0x1.69b34e63ba304p+6, 0x1.48ccd548faed1p+6, 0x1.c87347d17e302p-6, 0x1.c0f755fc0298dp-3, 0x1.fd01d53e5c562p+0, 0x1.9ff49a25e2eaap+6, 2, false, 0x1.13b35be5bc35bp+2, 0x1.3a7899255843p-9, 0x1.655cee03d340ep-4},
+    {0x1.859ac462458ccp+6, 0x1.564d95ff2a5c5p+6, 0x1.37c1804c2925bp-5, 0x1.94b165f99b06ap-2, 0x1.0fcf502d54fb3p+0, 0x1.c00b950a9cc84p+6, 2, true, 0x1.332dab985cca2p-1, 0x1.c2b332c507762p-11, 0x1.c5db38d856efcp-6},
+    {0x1.72cc84676d9a1p+6, 0x1.7f2e38dddaf53p+6, 0x1.915c775275bp-5, 0x1.8cd88573459c2p-3, 0x1.869f0c0bf375fp-1, 0x1.aa6b31dd57a45p+6, 2, false, 0x1.6ca987d43f4ep+2, 0x1.e785891287112p-10, 0x1.4f5f633049261p-4},
+    {0x1.6572b4f6777fdp+6, 0x1.7638154930756p+6, 0x1.7a87d6ff1303ap-5, 0x1.6d8146187bccep-2, 0x1.52267d7b1826bp-1, 0x1.9b10b681d6396p+6, 2, false, 0x1.191f1bd25012dp+3, 0x1.9d4432783661ep-9, 0x1.0ffa0b3c7afddp-3},
+    {0x1.8376cc32adaa6p+6, 0x1.82e34a0c897p+6, 0x1.7a64cdf8ea929p-5, 0x1.26f56bca4e69p-1, 0x1.fdc6531cd8962p-2, 0x1.49582d917a04p+6, 3, true, 0x1.94549506dc461p+3, 0x1.0d20fee186db5p-7, 0x1.27c253af2867fp-2},
+    {0x1.92cf2157d641bp+6, 0x1.969629ae5f466p+6, 0x1.7c97c71efe6bdp-5, 0x1.0e04c2b2c22f1p-3, 0x1.56a7a18e2ba55p+0, 0x1.566342bddc84ap+6, 3, true, 0x1.1b0079e8a40ep+3, 0x1.366adf278ac63p-9, 0x1.d6eae1926b947p-4},
+    {0x1.9b59aa94fd50ep+6, 0x1.bc55bca69d007p+6, 0x1.128d049a6ffd6p-5, 0x1.d749186653986p-2, 0x1.a175564fb623p-1, 0x1.d90d842b56836p+6, 2, false, 0x1.a7cf799433842p+3, 0x1.587d784d28d48p-8, 0x1.b30a0052535b8p-3},
+    {0x1.53d0072a3bc66p+6, 0x1.3fb37bead53e5p+6, 0x1.543a32aa0ec37p-5, 0x1.152566d80c9a8p-2, 0x1.0b30411f3f17dp+0, 0x1.20d7394a4c68ap+6, 3, false, 0x1.a34c197ee9deap-4, 0x1.a841de2c63c63p-13, 0x1.a896f3f18eaebp-8},
+    {0x1.cec4fe9f3494dp+6, 0x1.96a6cf193f6b4p+6, 0x1.76a7bec0cc24ep-5, 0x1.650220b31051ep-3, 0x1.290741bddd8e6p-2, 0x0p+0, 0, false, 0x1.22ec680e47176p-2, 0x0p+0, 0x1.c2a56c0052d2ep-7},
+    {0x1.b6d77b7725781p+6, 0x1.b485874109315p+6, 0x1.24fa555fdc347p-5, 0x1.bd0b78df9dd8p-4, 0x1.29eb072bb776p+0, 0x1.7503f5bedfd94p+6, 3, true, 0x1.fa33ac057d0e8p+2, 0x1.e34de9f0d54efp-10, 0x1.8baa065403017p-4},
+    {0x1.a40ddb4cecfd5p+6, 0x1.c107052525a22p+6, 0x1.4f7a7c85bcd7fp-6, 0x1.2bb47635df8f7p-3, 0x1.86fea7b40c10dp-1, 0x0p+0, 1, true, 0x1.fcfbddc9ce3a7p-1, 0x1.a79d39cbf8762p-11, 0x1.c1308c730265cp-6},
+    {0x1.c58b718184816p+6, 0x1.82ffb80188a5ap+6, 0x1.74e81f26911f5p-5, 0x1.e4cde161251a8p-2, 0x1.115fee9ffe684p+0, 0x1.04c9c7aa78fd9p+7, 2, false, 0x1.dc32d1972e6bfp+2, 0x1.13a1dfb3f8685p-8, 0x1.381c6c333cd3bp-3},
+    {0x1.98311927e4b71p+6, 0x1.5c5a753ce2c91p+6, 0x1.58e8df136d5dcp-5, 0x1.392f19cdc11a2p-3, 0x1.acbdcbf4ba176p+0, 0x0p+0, 0, true, 0x1.5fcce2f5da14ap+4, 0x0p+0, 0x1.8207ee086996fp-3},
+    {0x1.b4af7b982c313p+6, 0x1.89327eb7015b3p+6, 0x1.a97c6d5f4c35dp-6, 0x1.019a12bbbdbd6p-1, 0x1.75abec449486ap-1, 0x1.f630348899388p+6, 2, true, 0x1.e0145df39b5ffp-2, 0x1.9cfde4798dd91p-11, 0x1.9f1844b2ae14p-6},
+    {0x1.c5b3cafbb33ccp+6, 0x1.8761ed31fd85ap+6, 0x1.74a63dc250e77p-6, 0x1.ddceb2c79a3fcp-2, 0x1.2fa9d9370e9a7p+0, 0x1.81a59fbc585ap+6, 3, false, 0x1.ebff5b39e8958p-12, 0x1.b6ff07a99dd76p-18, 0x1.b1eecc25f5cfbp-13},
+    {0x1.68fb00246d00dp+6, 0x1.74b30dcaa4fbbp+6, 0x1.db2bafe32809ep-6, 0x1.818b6513ac206p-2, 0x1.9bf9e05037a01p-2, 0x0p+0, 1, false, 0x1.94a35e8ec0838p+2, 0x1.5549109f5401ap-10, 0x1.30803adf0b0c5p-4},
+    {0x1.5fb6e15a0080ap+6, 0x1.3ac43eb93e7a6p+6, 0x1.0a19b10c5952ap-5, 0x1.a0a6d63594e0ep-4, 0x1.ce1512f27f4e3p+0, 0x0p+0, 0, false, 0x1.22caa26e3155bp-1, 0x0p+0, 0x1.4e9d074926f92p-6},
+    {0x1.7d0d6c3d5ddf5p+6, 0x1.772d2c03dd3b5p+6, 0x1.855875697db6bp-5, 0x1.a762453ae2693p-3, 0x1.032d37c128a1bp+0, 0x0p+0, 0, true, 0x1.5e0e834163f1bp+3, 0x0p+0, 0x1.329e25afccd7fp-3},
+    {0x1.9f780dd95b5aep+6, 0x1.bc785b223fd27p+6, 0x1.313b4252dbf01p-5, 0x1.3ff1b026a15c6p-2, 0x1.3148c556f1d2cp+0, 0x1.ddca0fed290eep+6, 2, false, 0x1.666edf71f00c3p+3, 0x1.1c5a0b6e4c126p-8, 0x1.6a9b4dd41fe4bp-3},
+    {0x1.a1a0445230419p+6, 0x1.c262393bf76c1p+6, 0x1.4b24862bc44dp-5, 0x1.920502ab1db58p-2, 0x1.baaaeac823e09p+0, 0x1.62fb6d45dc37bp+6, 3, true, 0x1.da8a4dfdfe47bp+3, 0x1.817db1337d6f9p-7, 0x1.9a18e1996b449p-2},
+    {0x1.457e95752b8e5p+6, 0x1.59d7f33485921p+6, 0x1.202f8f405cecap-5, 0x1.75b7c39c0dd0dp-3, 0x1.449e89eb3a6b7p+0, 0x1.76519246bee3ap+6, 2, true, 0x1.cb7120830b372p-4, 0x1.a421300360b97p-13, 0x1.a5a27adc67abdp-8},
+    {0x1.bac546237e11bp+6, 0x1.a6a80b5ae5235p+6, 0x1.a887a20dad13ep-6, 0x1.ee17ae23246ep-2, 0x1.2885238f43da9p-2, 0x0p+0, 0, false, 0x1.0ece5ae38fc47p+3, 0x0p+0, 0x1.f9f3dade725d6p-4},
+    {0x1.4b3eb0cecd85ap+6, 0x1.230522edf6ae2p+6, 0x1.4811c97f8acc9p-5, 0x1.02d2136245757p-1, 0x1.33e6dfbfecf3ap+0, 0x0p+0, 1, true, 0x1.05a2af76e8dd2p+4, 0x1.4fdfc237fc5c9p-8, 0x1.d43ca05b0beb3p-3},
+    {0x1.961efcdce2207p+6, 0x1.89d7dc5ba954dp+6, 0x1.68253e5dd836fp-5, 0x1.12088f7794cdep-1, 0x1.a66c9713ae35fp+0, 0x0p+0, 0, false, 0x1.5454cbeb4f9a6p+4, 0x0p+0, 0x1.e8f9e81d01a6dp-3},
+    {0x1.a6ceb154423dfp+6, 0x1.bb85fdb477c1ap+6, 0x1.7fce6989fcbadp-6, 0x1.e9785f6eefbf8p-2, 0x1.04dbcc47eb4e8p-1, 0x1.e63a7f20e5c73p+6, 2, true, 0x1.0d755bd6fff2dp-4, 0x1.9b0910a13d1f7p-13, 0x1.9878bf0739b1cp-8},
+    {0x1.b73f05499f2e2p+6, 0x1.9bc0ce83fb4cep+6, 0x1.5ab24ca1ed90bp-5, 0x1.da0f6be0e542p-2, 0x1.43c196fe48dd5p-1, 0x1.755bf7b1c74dap+6, 3, true, 0x1.fdce7670217eap+3, 0x1.1be859c97c14dp-7, 0x1.448b08157cffbp-2},
+    {0x1.bc11a5602e6eap+6, 0x1.f6b5b2ac2449fp+6, 0x1.71744be68a95dp-5, 0x1.b65d1fe57e81p-2, 0x1.b288f0da3a123p-1, 0x0p+0, 1, true, 0x1.6bad5f98138f4p+2, 0x1.fcffce2a8f85fp-9, 0x1.151ebeb71907ep-3},
+    {0x1.add98a2f97f2dp+6, 0x1.968cc6532bf0fp+6, 0x1.988294da23be8p-5, 0x1.2b7407489394cp-3, 0x1.4783ea1237d65p+0, 0x1.6d5f4f0edac19p+6, 3, true, 0x1.c34feeb349cc3p+3, 0x1.4c4038502bbc9p-9, 0x1.378bf7b94756ep-3},
+    {0x1.591d49c7287efp+6, 0x1.7e3b36fc9e685p+6, 0x1.37954ef616b75p-5, 0x1.eb74cc2db2b88p-2, 0x1.c9e86dacb6a3cp+0, 0x0p+0, 0, true, 0x1.4a1497ad00622p+4, 0x0p+0, 0x1.e6e1e9a1d2a99p-2},
+    {0x1.663498405046bp+6, 0x1.5bc98727c7457p+6, 0x1.1cfb183874f85p-5, 0x1.b096302a22113p-3, 0x1.cae00d67ad57ap-1, 0x1.9befaf16c2b7ap+6, 2, false, 0x1.134c5d35056b3p+2, 0x1.f191b4982c28p-10, 0x1.2e779655fab55p-4},
+    {0x1.bf3ed7a074e91p+6, 0x1.d048b70968945p+6, 0x1.6ac93e486624cp-6, 0x1.06cf4ca5ff5b8p-1, 0x1.5830749b453c3p-1, 0x0p+0, 0, false, 0x1.4256db01a0492p+4, 0x0p+0, 0x1.ccd231fadb5a2p-3},
+    {0x1.a8832d157ecc6p+6, 0x1.92855cb751ef4p+6, 0x1.014616971e8d8p-5, 0x1.7a7791017443p-2, 0x1.3fc3d2aee1ee3p+0, 0x1.68d5e6524560fp+6, 3, false, 0x1.12038db309cc3p-4, 0x1.9a913d1ffa35bp-13, 0x1.9816e042f53e3p-8},
+    {0x1.8624589706ee6p+6, 0x1.9f0b751a984e7p+6, 0x1.929292cbe7af3p-5, 0x1.6165c420bf84p-3, 0x1.93adaaef0599fp-2, 0x0p+0, 0, false, 0x1.aff4f98612d1dp+2, 0x0p+0, 0x1.26bae841060bbp-4},
+    {0x1.45340acf23c4ap+6, 0x1.2fb8fcc005d8cp+6, 0x1.4e3a3de5e3064p-6, 0x1.04138bf9e9e32p-1, 0x1.1a82ac39aa845p+0, 0x0p+0, 1, false, 0x1.aca88f4bf8ae6p+2, 0x1.1c61e09f25b9dp-9, 0x1.88bc3f35aef53p-4},
+    {0x1.46d8b0b423105p+6, 0x1.75332797f2525p+6, 0x1.536d5f7a5a97ep-5, 0x1.9795998e1d1c4p-2, 0x1.5825c9e1f84a5p+0, 0x1.15d1c965ea9abp+6, 3, true, 0x1.2ecca5ea34277p+3, 0x1.ed3902306cdc8p-8, 0x1.0642add05791fp-2},
+    {0x1.bd9ac7a2d344bp+6, 0x1.93a65965d5a87p+6, 0x1.1f173291d15b1p-5, 0x1.2f421db1f7126p-2, 0x1.b3937e738789ep-1, 0x0p+0, 1, true, 0x1.c21f6ae492555p+3, 0x1.40b6e0e90537cp-9, 0x1.32ba1cdb85052p-3},
+    {0x1.73a9b4f5d7f0cp+6, 0x1.a1f564f9a85d5p+6, 0x1.8ad2af4e9668p-5, 0x1.2828becaa70a8p-1, 0x1.ffcb07a496f5cp+0, 0x0p+0, 1, true, 0x1.cfa1c7e4e8a0dp+3, 0x1.3fee8b80eab5cp-7, 0x1.5d3d7c679c156p-2},
+    {0x1.cce59dbdf7948p+6, 0x1.8eb51526002b2p+6, 0x1.b9085f63f7a77p-6, 0x1.2c886cafd1735p-1, 0x1.e15168510ac0ep-1, 0x0p+0, 0, false, 0x1.f98b593a46956p+3, 0x0p+0, 0x1.accb7ad51e791p-3},
+    {0x1.7860f9f001206p+6, 0x1.420601aad9efap+6, 0x1.96435733574dcp-6, 0x1.29395bf042898p-1, 0x1.877595ea02baap-1, 0x1.b0d5ec3a67b2p+6, 2, false, 0x1.cd1f634c521fep+2, 0x1.f5f04764ad779p-9, 0x1.20968d8d7ec94p-3},
+    {0x1.d67772b21f0c5p+6, 0x1.e999853598f96p+6, 0x1.c2aea0f78cbbep-6, 0x1.ca77d8829b9a8p-2, 0x1.3b1347e882cdfp+0, 0x0p+0, 1, false, 0x1.db7320a288836p+3, 0x1.6fba607d8786ep-9, 0x1.5cc7c4b1e214ap-3},
+    {0x1.830105fcb8b2dp+6, 0x1.7df5aaad384ccp+6, 0x1.78267c0b47a62p-6, 0x1.17cc145eeb94cp-1, 0x1.32b4a04ee7b9ep+0, 0x1.48f411e39cfe6p+6, 3, true, 0x1.e326df41f8059p+3, 0x1.b8c29978946cap-7, 0x1.ce30ca42ae97ap-2},
+    {0x1.d97940d9e1771p+6, 0x1.fd6b2dd612c18p+6, 0x1.282bb5588a47ap-5, 0x1.aaa78735307dep-2, 0x1.b96e317c58afep+0, 0x1.103f5216e1a47p+7, 2, false, 0x1.dc62899c3ed5dp+3, 0x1.c97ed07ca5796p-8, 0x1.10a2f40640602p-2},
+    {0x1.5c33829d3ac2ep+6, 0x1.40b94a269581cp+6, 0x1.896fd94179454p-6, 0x1.f6dd0493ebdd4p-4, 0x1.ee30b5059cf67p-2, 0x1.906e6fce69f9bp+6, 2, false, 0x1.f12670c12e417p-2, 0x1.f3816f0f6d47cp-12, 0x1.034f6764183c4p-6},
+    {0x1.9fcb7f8a432b1p+6, 0x1.cdb9ee0339fcp+6, 0x1.6a1c4cc6e8b56p-5, 0x1.ea2aef603a9b2p-2, 0x1.0c5376dbf0d2cp+0, 0x1.de2a05df00718p+6, 2, true, 0x1.950880fbb2379p-9, 0x1.ced6ebc225565p-16, 0x1.c9ab9a705b57bp-11},
+    {0x1.917457f5cb0c5p+6, 0x1.70c34cb6f7a19p+6, 0x1.68e141253b761p-6, 0x1.55c4b1108452ep-2, 0x1.232b178040fdfp+0, 0x1.553c7df752fdap+6, 3, false, 0x1.2e077804faacfp-5, 0x1.f66cc71589935p-14, 0x1.f2d93052f1f5ep-9},
+    {0x1.6fb89a393dcb5p+6, 0x1.65459f8483268p+6, 0x1.8a1cae3507261p-5, 0x1.69463c410bdb6p-2, 0x1.d4eeba168e278p+0, 0x0p+0, 1, true, 0x1.9b0b7f5c6ba72p+3, 0x1.33f163b22cc9bp-8, 0x1.921009c13619p-3},
+    {0x1.b9cfd3fd0a32ap+6, 0x1.92ca1e8595037p+6, 0x1.3c0b402ab0ac7p-5, 0x1.27e8851436918p-1, 0x1.e8ce6dd09866p+0, 0x1.778a40fd7bde4p+6, 3, true, 0x1.54204033e1dd4p+4, 0x1.821f4231cdc96p-6, 0x1.8cca33f92b872p-1},
+    {0x1.b1d014c81c79p+6, 0x1.753d30677dc46p+6, 0x1.05743196bd168p-5, 0x1.c897409110cdcp-4, 0x1.b5b0b32cc7731p-1, 0x1.70bdab43b1cd4p+6, 3, false, 0x1.a9ed576e4ba34p-10, 0x1.5cf645452f8fp-17, 0x1.5944d9cab856p-12},
+    {0x1.d75d96b6181f7p+6, 0x1.fd2f088042c1cp+6, 0x1.47c9761e244a8p-5, 0x1.c47ab8acaf8eep-3, 0x1.2c3928a2e4c59p+0, 0x0p+0, 0, false, 0x1.a96602a11c2f8p+3, 0x0p+0, 0x1.3f810a97ae918p-3},
+    {0x1.75cc755e14fdap+6, 0x1.51eb10cdccf5cp+6, 0x1.93ee952a3d51bp-5, 0x1.a7058b314e78p-2, 0x1.32599c218765dp+0, 0x0p+0, 1, false, 0x1.1715a20030983p+2, 0x1.05a566599d84bp-9, 0x1.3a41ac17ac7b2p-4},
+    {0x1.539c1560b8f8bp+6, 0x1.711130c3ffb58p+6, 0x1.72c9e7df2a8b3p-5, 0x1.0901159ff7a5cp-3, 0x1.ba37dbd7b8ef4p+0, 0x0p+0, 1, true, 0x1.d593221bde687p+0, 0x1.1e016489fdfbap-10, 0x1.401878e7746ddp-5},
+    {0x1.85e10b0e5dda7p+6, 0x1.b433b80a12db6p+6, 0x1.28d21817791b9p-5, 0x1.e68c6113c8ab4p-2, 0x1.6d66fe492fe22p+0, 0x1.c05c66508587fp+6, 2, true, 0x1.5183165349f59p-10, 0x1.02d6dcb1af241p-16, 0x1.ffc1136c5ce81p-12},
+    {0x1.5ac145ead6d39p+6, 0x1.637fb7031acbap+6, 0x1.403305ca28a2ap-5, 0x1.d7c8b4e9c7b1ap-2, 0x1.7e53843e47553p+0, 0x0p+0, 1, false, 0x1.58b99ba009c46p+3, 0x1.28c35f28cc124p-9, 0x1.06f543ea6886ep-3},
+    {0x1.de0da5f09d2b9p+6, 0x1.bc4667a7d09f4p+6, 0x1.3d0fbfda7055ep-5, 0x1.62800b4c83ba9p-2, 0x1.b8affd7a2eea2p+0, 0x1.12e1729d8d92ap+7, 2, true, 0x1.3c0dd3405912fp-2, 0x1.4823587b5e359p-11, 0x1.48199037532fdp-6},
+    {0x1.4a24a46eef8b6p+6, 0x1.5c969d88cfcbdp+6, 0x1.3cb025d0bc7cdp-5, 0x1.271651be19555p-1, 0x1.da8ec2d2b142dp+0, 0x0p+0, 1, false, 0x1.ea2c80769b992p+3, 0x1.241e2d6bc86ep-9, 0x1.4d169ba000a76p-3},
+    {0x1.89c68ec65a4abp+6, 0x1.8a00b3cbce1a8p+6, 0x1.647535331fbfcp-6, 0x1.cf52ee4d89b69p-3, 0x1.36ba9d9539f2p+0, 0x1.4eb592f566591p+6, 3, true, 0x1.40f893357e046p+3, 0x1.26253107e3cedp-8, 0x1.63f005b84c0b8p-3},
+    {0x1.478429e93dcb4p+6, 0x1.6f1f7020683ffp+6, 0x1.8ce866e524d07p-5, 0x1.2218fbf5babfap-3, 0x1.893ba1464f43bp+0, 0x0p+0, 0, true, 0x1.1546bd8c8e1d7p+2, 0x0p+0, 0x1.50763f5bf15b9p-4},
+    {0x1.752ea991e96dp+6, 0x1.93d773ee5cb05p+6, 0x1.540458e725cbfp-6, 0x1.fe287c46abc84p-2, 0x1.d44af59818367p+0, 0x1.ad28dc9affa3bp+6, 2, true, 0x1.3e9bd2cb9e1fep-8, 0x1.685d2d5b4b48ap-15, 0x1.6458090b42d29p-10},
+    {0x1.8cd313b437842p+6, 0x1.c5d701f62b38fp+6, 0x1.40be6ff57450cp-5, 0x1.6fe1124cd8c8ap-3, 0x1.63ebcfd9ab1dcp+0, 0x1.c8592375a63e5p+6, 2, false, 0x1.6379ff5bff211p+3, 0x1.7737edfeff217p-9, 0x1.22498b2252fcfp-3},
+    {0x1.4160f481dd645p+6, 0x1.696e9bdce3d6ep+6, 0x1.ab98b3b568f59p-6, 0x1.fa53ccea847f7p-3, 0x1.5090ef43a3015p-2, 0x0p+0, 0, true, 0x1.86b45220f40c9p+0, 0x0p+0, 0x1.5f1d47092fb4ep-5},
+    {0x1.6c57893445caep+6, 0x1.62e0adebefaa1p+6, 0x1.8cfd2511ccd1ap-5, 0x1.cf35b068b69cep-2, 0x1.2bf5404fd6a85p-1, 0x1.35b0ce393b52dp+6, 3, false, 0x1.3e445548dfb1dp-3, 0x1.3f4f2113e6345p-12, 0x1.3f9ef3043cf9dp-7},
+    {0x1.7ca7cf11d712ap+6, 0x1.a2897972ab7adp+6, 0x1.6b84cfd8c1249p-5, 0x1.997a4c56dd43p-2, 0x1.4bd053c5d252cp-1, 0x1.438ea33590697p+6, 3, false, 0x1.1d9d15da139f7p+0, 0x1.2f20e99d126abp-10, 0x1.2c10a0a4883bbp-5},
+    {0x1.821ee6ff5bb6fp+6, 0x1.566c4e7274998p+6, 0x1.1d5f3f2145116p-5, 0x1.ed73f1416f7ffp-4, 0x1.3871db2919372p+0, 0x1.bc09f00c0fdf2p+6, 2, true, 0x1.6814be0af77c1p+2, 0x1.541b6586c734ep-9, 0x1.1a38b8c5185b5p-4},
+    {0x1.b9ef44cbd3c43p+6, 0x1.ac2cdb0564fa8p+6, 0x1.513219485eabcp-5, 0x1.10e29411b2f1dp-1, 0x1.20efd00a0161fp+0, 0x1.77a4fa7a0d99fp+6, 3, false, 0x1.ba35d506ef6d9p-5, 0x1.a138286cef0ebp-13, 0x1.9dd0e760d4ef8p-8},
+    {0x1.c2a55a2e0f537p+6, 0x1.d589f6adafadbp+6, 0x1.d8a4d42871305p-6, 0x1.18e88ccec2ce3p-1, 0x1.6da75d629ebfp+0, 0x1.031f13da7c032p+7, 2, false, 0x1.e5da6a4160041p+3, 0x1.dfc531668115ep-8, 0x1.1b793179fa75cp-2},
+    {0x1.dac05dc72d02ep+6, 0x1.0bb288c582b84p+7, 0x1.26093a6db2c8cp-5, 0x1.b91cc6ca9486cp-2, 0x1.09294d5ae6ed2p+0, 0x1.9389e94fb30f4p+6, 3, false, 0x1.bee9f5123b304p-1, 0x1.3aa76cfb48f39p-10, 0x1.3ecad82fc754fp-5},
+    {0x1.4f6eb1edf127dp+6, 0x1.37222cc08eacdp+6, 0x1.96a93eee9e38dp-6, 0x1.bf4e99e56970ep-3, 0x1.57e9295549a31p+0, 0x0p+0, 1, false, 0x1.da6c6b761e543p+0, 0x1.19ac3c01212dp-10, 0x1.3d0fbe561020ep-5},
+    {0x1.c7495153528c6p+6, 0x1.f85dd79578322p+6, 0x1.77e89d3c9fdefp-6, 0x1.a507867d4e538p-3, 0x1.26d7c104b3d15p+0, 0x0p+0, 1, true, 0x1.1d20ba4fb10bp+1, 0x1.c4cf215c8b66dp-10, 0x1.e33fe5087d48ep-5},
+    {0x1.cb6588325f657p+6, 0x1.f7b84d7d137a6p+6, 0x1.563e1bc7bbde6p-6, 0x1.e85d885e2c964p-2, 0x1.77819463ddbe2p+0, 0x1.867cb3c46aafdp+6, 3, false, 0x1.4be2535ee416cp-2, 0x1.70c9176e378aep-11, 0x1.704958daa2e8p-6},
+    {0x1.a0f3ac7a7e328p+6, 0x1.653f79c2dd3a7p+6, 0x1.ef6dbee50b2f9p-6, 0x1.c7aead76477b8p-2, 0x1.e980930127f12p+0, 0x1.df7e9ff34453ap+6, 2, false, 0x1.0aa9cfdf550bbp+3, 0x1.31ba9e1830784p-8, 0x1.5afed95c18f3fp-3},
+    {0x1.985f1c0c9995ap+6, 0x1.5b2065a91b418p+6, 0x1.974c86ac5f6fep-5, 0x1.dd479da83a6b4p-2, 0x1.76ae61c11e4dep-1, 0x1.d5a09374e3d27p+6, 2, false, 0x1.608535e65a8dep+2, 0x1.9df1cee1ca834p-9, 0x1.d328192e95cp-4},
+    {0x1.c2789765732cfp+6, 0x1.fcaa577bf0f8p+6, 0x1.8131c1fa1914dp-5, 0x1.fe58d9100df71p-3, 0x1.9ca98b1766159p+0, 0x1.7ee680afd5196p+6, 3, true, 0x1.571e8543e6106p+3, 0x1.a84085c65288bp-8, 0x1.d947a472bc59fp-3},
+    {0x1.89737f6bab7d1p+6, 0x1.bd1ae24d7d5ep+6, 0x1.969b62e7cccf4p-5, 0x1.f9a210cb170cdp-4, 0x1.349b76c3e61c6p+0, 0x1.c47805bbd203p+6, 2, true, 0x1.cd4803c0c9cap-8, 0x1.c7c22fce95242p-16, 0x1.c3e52e1b795bbp-11},
+    {0x1.913559c37634fp+6, 0x1.9e2a6244dba51p+6, 0x1.352c6c36b3732p-5, 0x1.59bbce99ef15dp-3, 0x1.348b910b514fdp+0, 0x1.5506f2b2f1469p+6, 3, true, 0x1.f8eed8635bf65p+2, 0x1.95b22157bcde9p-9, 0x1.01782d9a48c11p-3},
+    {0x1.63933531a636bp+6, 0x1.401267342598bp+6, 0x1.36555ae9b44dcp-5, 0x1.672bf98d7282ap-3, 0x1.0c25738879a76p+0, 0x1.98e949f918beep+6, 2, true, 0x1.5bfa028eca86cp+1, 0x1.c8eec12cee17ep-10, 0x1.957426976e661p-5},
+    {0x1.4079a52437619p+6, 0x1.4c0af92957d41p+6, 0x1.807da93f225cep-5, 0x1.4901224fcb6ccp-3, 0x1.b06b7578474cp+0, 0x0p+0, 0, true, 0x1.0c1cfc2bfd5c4p+3, 0x0p+0, 0x1.f1e71345deb46p-4},
+    {0x1.6d522fc31f17cp+6, 0x1.9acc686b4574fp+6, 0x1.750ce1d52073cp-6, 0x1.18df10be0a3a5p-1, 0x1.064a9fcec3fa1p+0, 0x0p+0, 1, false, 0x1.201d69f8bbccdp+4, 0x1.e25902f195c8fp-10, 0x1.5ebdb9926a1fap-3},
+    {0x1.5631c3c3fd19bp+6, 0x1.2744f0f2dc439p+6, 0x1.e7c61c368b9dbp-6, 0x1.15ff124b7c394p-2, 0x1.179db2f071647p+0, 0x1.22dd800030bc4p+6, 3, true, 0x1.d14c0886ed47dp+3, 0x1.4b38e498b06c3p-8, 0x1.b895dda486b7bp-3},
+    {0x1.acb6943fc4db5p+6, 0x1.de883d318fb8fp+6, 0x1.6f37b4e297efdp-5, 0x1.0b8a81a1481f3p-1, 0x1.7098cb75f593dp-1, 0x1.ed052a7c88c8fp+6, 2, true, 0x1.640d26e28c37bp-9, 0x1.9ac10b5c68bc5p-16, 0x1.96296b2326a8ap-11},
+    {0x1.4ad26a2490e2cp+6, 0x1.761d134d97cabp+6, 0x1.82ce457d557dep-5, 0x1.155b232425a54p-1, 0x1.8e1ea6750ad9cp+0, 0x0p+0, 1, false, 0x1.102ad79ec7065p+4, 0x1.eabd2dc30bf25p-10, 0x1.547587711858p-3},
+    {0x1.46fe21b799cap+6, 0x1.48b330dfccea4p+6, 0x1.505b1f355d9b8p-5, 0x1.2ecbb9de001c7p-1, 0x1.f6af4a33b03d9p+0, 0x0p+0, 0, true, 0x1.c6304d29a7ab5p+4, 0x0p+0, 0x1.63f8b6eb1aef1p-1},
+    {0x1.7aa72a4ecda1ep+6, 0x1.62948735bb61cp+6, 0x1.1154cfadb824ap-5, 0x1.07b28f9f03771p-3, 0x1.c8665289fd5b2p-1, 0x1.b37370a76c7a2p+6, 2, false, 0x1.59352ba6435b8p+0, 0x1.f22b84aec1da3p-11, 0x1.0dcccc1d8428cp-5},
+    {0x1.892a7fa547138p+6, 0x1.b628732be0141p+6, 0x1.06d5ad9fc62e1p-5, 0x1.8d2c09b66a59p-2, 0x1.a2f559f88952ep+0, 0x1.4e30ec7faf9d6p+6, 3, false, 0x1.e08f9f96963dep-2, 0x1.9d53ae01316f2p-11, 0x1.9f9c6c8b34eep-6},
+    {0x1.67ba11d72b82fp+6, 0x1.8ebf563165be6p+6, 0x1.7041e38ee347dp-5, 0x1.ef6eabf18d0b4p-2, 0x1.5c22feb86a7c7p-2, 0x0p+0, 0, false, 0x1.e58ea83739055p+3, 0x0p+0, 0x1.3b40aeeb59997p-3},
+    {0x1.d477e68e6c197p+6, 0x1.9236afb5528b4p+6, 0x1.54e140a26ffafp-5, 0x1.3c4391ace6b12p-2, 0x1.c8c4cd4d7f019p+0, 0x1.8e32b72c4248dp+6, 3, true, 0x1.6a5b7ef305641p+4, 0x1.7743f7580a296p-7, 0x1.b5597881521b3p-2},
+    {0x1.423e8a2624354p+6, 0x1.6d37bf89333cap+6, 0x1.09fe1cafa6ff2p-5, 0x1.1e9a6d8c88afbp-1, 0x1.2761907d29c07p+0, 0x0p+0, 0, false, 0x1.7cef533d263fep+4, 0x0p+0, 0x1.d0a5af718fea8p-3},
+    {0x1.5b418bc123c31p+6, 0x1.5566ec3098a58p+6, 0x1.4d14f15aeb097p-5, 0x1.08706384e68a7p-2, 0x1.df143d76104ffp-1, 0x0p+0, 1, false, 0x1.bd99067d738fep+1, 0x1.5fb9d1164dbfbp-10, 0x1.c199c00a7ba1fp-5},
+    {0x1.c690b4f8aea9p+6, 0x1.8fa1fabb8d3abp+6, 0x1.1089f3c32fc65p-5, 0x1.d8f89ebcd572bp-3, 0x1.22859c67b15e3p+0, 0x0p+0, 1, false, 0x1.1ec542de0e34fp+0, 0x1.01e7fd5bc0e0bp-10, 0x1.0ee21f6c8f7d1p-5},
+    {0x1.4fb7c17f501dep+6, 0x1.7d94f0702c4aep+6, 0x1.64722deb91133p-6, 0x1.52c6a42a0ced5p-2, 0x1.553b68713bb64p+0, 0x1.821351b8cf558p+6, 2, true, 0x1.9e1098904b385p-12, 0x1.6128539a17a59p-18, 0x1.5d17b8c00414ep-13},
+    {0x1.51380f1449f48p+6, 0x1.5c36475f940f6p+6, 0x1.034c434d2ad97p-5, 0x1.67b5d1c797ac8p-2, 0x1.04d57ed1f859cp+0, 0x0p+0, 1, false, 0x1.e4c7a4d0669e8p+2, 0x1.b65e530e349d3p-10, 0x1.778fd9ee02198p-4},
+    {0x1.ab513a39ad6c9p+6, 0x1.a73a2d6f2db33p+6, 0x1.b082e6c769ee7p-6, 0x1.aee8173a1b69p-2, 0x1.020f38b94fbbcp-1, 0x0p+0, 0, false, 0x1.6bc304e2653a7p+3, 0x0p+0, 0x1.2f8dad401b9afp-3},
+    {0x1.6fb06c8864aa7p+6, 0x1.819cbd42c575bp+6, 0x1.6fc16e23cdd8cp-5, 0x1.61f954046c1d4p-2, 0x1.ca03c4da338bep+0, 0x0p+0, 1, true, 0x1.28a35fd875effp+3, 0x1.2480a43bf35cfp-8, 0x1.59d32b2995e84p-3},
+    {0x1.504c8ef4f86afp+6, 0x1.65b7c68df171p+6, 0x1.7f2f489192d05p-5, 0x1.be9aef333a2cap-2, 0x1.2974f65e25c1bp-2, 0x1.82be713350e16p+6, 2, false, 0x1.1a1963ec421fbp+3, 0x1.444232ac6db9p-9, 0x1.dfb7c8adbfbcfp-4},
+};
+// END REFERENCE DATA
 
-        opts[i].spot = spot;
-        opts[i].strike = strike;
-        opts[i].rate = rate_dist(rng);
-        opts[i].vol = vol_dist(rng);
-        opts[i].time_to_expiry = tte_dist(rng);
-        opts[i].type = type;
-        opts[i].is_call = call_dist(rng) == 1;
-
-        // Barrier: 10-20% away from spot
-        if (type == 2) opts[i].barrier = spot * 1.15;      // up-and-out
-        else if (type == 3) opts[i].barrier = spot * 0.85;  // down-and-out
-        else opts[i].barrier = 0.0;
-    }
-    return opts;
-}
-
-// 200 options, 10K paths, 100 steps → targets ~20s with naive implementation
 constexpr int NUM_OPTIONS = 200;
 constexpr int PATHS = 10000;
 constexpr int STEPS = 100;
 
-static auto options = generate_options(NUM_OPTIONS, 0xABCD01);
+std::vector<hftu::MCOption> options_of(const RefRow* rows) {
+    std::vector<hftu::MCOption> opts(NUM_OPTIONS);
+    for (int i = 0; i < NUM_OPTIONS; i++) {
+        const RefRow& r = rows[i];
+        opts[i] = {r.spot, r.strike, r.rate, r.vol, r.time_to_expiry, r.barrier, r.type, r.is_call};
+    }
+    return opts;
+}
+
+static auto options = options_of(kScored);
+
 
 static hftu::RegisterBenchmark reg_solution("BM_Solution", NUM_OPTIONS,
     [](int iters) -> uint64_t {
@@ -63,6 +471,132 @@ static hftu::RegisterBenchmark reg_solution("BM_Solution", NUM_OPTIONS,
         }
         return total;
     });
+
+// ---------------------------------------------------------------------------
+// Validation: every result is compared with its reference price, in two ways.
+//   1. Precision. The error, in units of the standard error a plain
+//      10,000-path simulation would have, must stay within MAX_Z on every
+//      option. An honest 10k-path simulation fails this about once in 4,000
+//      runs; one with a quarter of the paths fails almost every time.
+//   2. Honest error. The same, in units of the std_error the solution reports.
+//      Variance reduction or any other method may report a smaller error, but
+//      the price must then be that accurate. A std_error of 0 on an
+//      approximate price, or one far below the real error, fails.
+// There is deliberately no limit on the batch average: reusing one set of paths
+// for every option (common random numbers, legitimate) makes the errors of a
+// batch move together, so an honest batch average swings far more than the
+// per-option bound allows for. The averages are printed for information only.
+// Both denominators include the reference's own standard error and an absolute
+// floor, so options whose price is (near) zero cannot fail on rounding.
+// Run on the scored batch and on the held-out batch, each priced by a fresh
+// pricer. This harness validates before it times; the certified one times
+// first and checks the timed call's own output, then a private held-out batch.
+// ---------------------------------------------------------------------------
+
+constexpr double MAX_Z = 5.0;
+constexpr double PRICE_FLOOR = 1e-3;
+
+const char* type_name(int type) {
+    switch (type) {
+        case 0: return "European";
+        case 1: return "Asian";
+        case 2: return "up-and-out";
+        case 3: return "down-and-out";
+        default: return "unknown";
+    }
+}
+
+void report_option(const char* test, const char* what, const char* unit, const RefRow& r,
+                   const hftu::MCResult& out, double z) {
+    char msg[512];
+    std::snprintf(msg, sizeof msg,
+                  "%s: %s %s S=%.6f K=%.6f B=%.6f r=%.6f vol=%.6f T=%.6f -> price %.8g, std_error %.8g "
+                  "(off by %.1f %s)",
+                  what, type_name(r.type), r.is_call ? "call" : "put", r.spot, r.strike, r.barrier, r.rate,
+                  r.vol, r.time_to_expiry, out.price, out.std_error, std::fabs(z), unit);
+    hftu::check_failed(test, msg);
+}
+
+bool validate_batch(const char* test, const RefRow* rows, const hftu::MCResult* out) {
+    int invalid = 0, imprecise = 0, overclaimed = 0, checked = 0;
+    int worst_invalid = -1, worst_p = -1, worst_c = -1;
+    double worst_zp = 0.0, worst_zc = 0.0, sum_zp2 = 0.0, sum_zc2 = 0.0;
+
+    for (int i = 0; i < NUM_OPTIONS; i++) {
+        const RefRow& r = rows[i];
+        const double price = out[i].price, se = out[i].std_error;
+        if (!std::isfinite(price) || !std::isfinite(se) || se < 0.0) {
+            if (worst_invalid < 0) worst_invalid = i;
+            ++invalid;
+            continue;
+        }
+        const double err = price - r.ref;
+        const double floor2 = r.ref_se * r.ref_se + PRICE_FLOOR * PRICE_FLOOR;
+        const double zp = err / std::sqrt(r.se10k * r.se10k + floor2);
+        const double zc = err / std::sqrt(se * se + floor2);
+        ++checked;
+        sum_zp2 += zp * zp;
+        sum_zc2 += zc * zc;
+        if (std::fabs(zp) > MAX_Z) ++imprecise;
+        if (std::fabs(zc) > MAX_Z) ++overclaimed;
+        if (std::fabs(zp) > std::fabs(worst_zp)) { worst_zp = zp; worst_p = i; }
+        if (std::fabs(zc) > std::fabs(worst_zc)) { worst_zc = zc; worst_c = i; }
+    }
+
+    bool ok = true;
+    char msg[512];
+    if (invalid > 0) {
+        const auto& o = out[worst_invalid];
+        std::snprintf(msg, sizeof msg,
+                      "%d of %d results have a price or std_error that is not a finite number, or a "
+                      "negative std_error (first: option %d, price %g, std_error %g)",
+                      invalid, NUM_OPTIONS, worst_invalid, o.price, o.std_error);
+        hftu::check_failed(test, msg);
+        ok = false;
+    }
+    const double mean_zp2 = checked ? sum_zp2 / checked : 0.0;
+    const double mean_zc2 = checked ? sum_zc2 / checked : 0.0;
+    if (imprecise > 0) {
+        std::snprintf(msg, sizeof msg,
+                      "prices are less precise than a 10,000-path simulation: %d of %d more than %.0f "
+                      "standard errors from the reference",
+                      imprecise, checked, MAX_Z);
+        hftu::check_failed(test, msg);
+        if (worst_p >= 0) report_option(test, "precision, worst case", "10k-path standard errors", rows[worst_p], out[worst_p], worst_zp);
+        ok = false;
+    }
+    if (overclaimed > 0) {
+        std::snprintf(msg, sizeof msg,
+                      "std_error understates the actual error: %d of %d prices more than %.0f reported "
+                      "std_errors from the reference",
+                      overclaimed, checked, MAX_Z);
+        hftu::check_failed(test, msg);
+        if (worst_c >= 0) report_option(test, "std_error, worst case", "reported std_errors", rows[worst_c], out[worst_c], worst_zc);
+        ok = false;
+    }
+    if (ok)
+        std::fprintf(stderr, "  %s: %d prices checked, mean squared error %.2f (10k-path SE) / %.2f (own std_error)\n",
+                     test, checked, mean_zp2, mean_zc2);
+    return ok;
+}
+
+bool price_and_validate(const char* test, const RefRow* rows) {
+    const auto batch = options_of(rows);
+    std::vector<hftu::MCResult> results(
+        NUM_OPTIONS, {std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN()});
+    hftu::MonteCarloPricer pricer;
+    pricer.build(PATHS, STEPS);
+    pricer.price_batch(batch.data(), results.data(), NUM_OPTIONS);
+    return validate_batch(test, rows, results.data());
+}
+
+static hftu::RegisterValidation val_accuracy("accuracy", []() -> bool {
+    return price_and_validate("accuracy", kScored);
+});
+
+static hftu::RegisterValidation val_accuracy_heldout("accuracy_heldout", []() -> bool {
+    return price_and_validate("accuracy_heldout", kHeldout);
+});
 
 } // anon namespace
 
