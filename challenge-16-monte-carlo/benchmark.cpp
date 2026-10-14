@@ -482,6 +482,11 @@ static hftu::RegisterBenchmark reg_solution("BM_Solution", NUM_OPTIONS,
 //      Variance reduction or any other method may report a smaller error, but
 //      the price must then be that accurate. A std_error of 0 on an
 //      approximate price, or one far below the real error, fails.
+//   3. Claimed precision. The reported std_error may not exceed MAX_SE_RATIO
+//      times a plain 10,000-path simulation's. With common random numbers a
+//      batch shares much of its noise, so check 1 alone can let fewer paths
+//      through on a lucky draw; a solution must claim 10k-path precision, and
+//      check 2 holds it to the claim.
 // There is deliberately no limit on the batch average: reusing one set of paths
 // for every option (common random numbers, legitimate) makes the errors of a
 // batch move together, so an honest batch average swings far more than the
@@ -495,6 +500,7 @@ static hftu::RegisterBenchmark reg_solution("BM_Solution", NUM_OPTIONS,
 
 constexpr double MAX_Z = 5.0;
 constexpr double PRICE_FLOOR = 1e-3;
+constexpr double MAX_SE_RATIO = 1.25;
 
 const char* type_name(int type) {
     switch (type) {
@@ -518,8 +524,9 @@ void report_option(const char* test, const char* what, const char* unit, const R
 }
 
 bool validate_batch(const char* test, const RefRow* rows, const hftu::MCResult* out) {
-    int invalid = 0, imprecise = 0, overclaimed = 0, checked = 0;
-    int worst_invalid = -1, worst_p = -1, worst_c = -1;
+    int invalid = 0, imprecise = 0, overclaimed = 0, underclaimed = 0, checked = 0;
+    int worst_invalid = -1, worst_p = -1, worst_c = -1, worst_se = -1;
+    double worst_se_ratio = 0.0;
     double worst_zp = 0.0, worst_zc = 0.0, sum_zp2 = 0.0, sum_zc2 = 0.0;
 
     for (int i = 0; i < NUM_OPTIONS; i++) {
@@ -539,6 +546,11 @@ bool validate_batch(const char* test, const RefRow* rows, const hftu::MCResult* 
         sum_zc2 += zc * zc;
         if (std::fabs(zp) > MAX_Z) ++imprecise;
         if (std::fabs(zc) > MAX_Z) ++overclaimed;
+        if (se > MAX_SE_RATIO * r.se10k + PRICE_FLOOR) {
+            ++underclaimed;
+            const double ratio = se / (r.se10k + PRICE_FLOOR);
+            if (ratio > worst_se_ratio) { worst_se_ratio = ratio; worst_se = i; }
+        }
         if (std::fabs(zp) > std::fabs(worst_zp)) { worst_zp = zp; worst_p = i; }
         if (std::fabs(zc) > std::fabs(worst_zc)) { worst_zc = zc; worst_c = i; }
     }
@@ -572,6 +584,19 @@ bool validate_batch(const char* test, const RefRow* rows, const hftu::MCResult* 
                       overclaimed, checked, MAX_Z);
         hftu::check_failed(test, msg);
         if (worst_c >= 0) report_option(test, "std_error, worst case", "reported std_errors", rows[worst_c], out[worst_c], worst_zc);
+        ok = false;
+    }
+    if (underclaimed > 0) {
+        std::snprintf(msg, sizeof msg,
+                      "std_error is larger than a 10,000-path simulation's: %d of %d options report more "
+                      "than %.2f times it",
+                      underclaimed, checked, MAX_SE_RATIO);
+        hftu::check_failed(test, msg);
+        const RefRow& r = rows[worst_se];
+        std::snprintf(msg, sizeof msg, "worst case: %s %s S=%.6f K=%.6f B=%.6f -> std_error %.8g, %.2f times that of 10,000 paths",
+                      type_name(r.type), r.is_call ? "call" : "put", r.spot, r.strike, r.barrier,
+                      out[worst_se].std_error, worst_se_ratio);
+        hftu::check_failed(test, msg);
         ok = false;
     }
     if (ok)
